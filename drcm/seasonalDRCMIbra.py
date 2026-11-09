@@ -17,12 +17,12 @@ import boto3
 
 gdal.UseExceptions()
 
-from refpix_numba_ibra import refpixelfilter_ibra
-from refpix_numba import refpixelfilternodata
+from .refpix_numba_ibra import refpixelfilter_ibra
+from .refpix_numba import refpixelfilternodata
 
 # when they specify --save
 SAVE_BUCKET = 'cibo-dat-oregon'
-SAVE_DIR = 'DRCM
+SAVE_DIR = 'DRCM'
 
 
 def format_time(seconds):
