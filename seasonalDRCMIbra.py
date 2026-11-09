@@ -13,11 +13,16 @@ import argparse
 import time
 import numpy as np
 from osgeo import gdal
+import boto3
 
 gdal.UseExceptions()
 
 from refpix_numba_ibra import refpixelfilter_ibra
 from refpix_numba import refpixelfilternodata
+
+# when they specify --save
+SAVE_BUCKET = 'cibo-dat-oregon'
+SAVE_DIR = 'DRCM
 
 
 def format_time(seconds):
@@ -116,6 +121,11 @@ def parse_args():
         action="store_true",
         help="Do not constrain by IBRA regions; calculate reference statistics using a single global histogram."
     )
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Save to S3 and delete local output file on completion"
+    )
     return parser.parse_args()
 
 
@@ -169,7 +179,8 @@ def run_seasonal_drcm_ibra(
     threads=None,
     overview_levels=(4, 8, 16, 32),
     no_overviews=False,
-    no_ibra=False
+    no_ibra=False,
+    save=False
 ):
     if threads is not None:
         import numba
@@ -407,6 +418,13 @@ def run_seasonal_drcm_ibra(
         f"Total: {total_pixels_processed:,} pixels in {total_str} (avg {overall_rate/1e6:.2f}M px/s)",
         flush=True
     )
+
+    # save to S3 if they asked for it
+    if save:
+        s3 = bobo3.client('s3')
+        s3.upload_file(output_file, SAVE_BUCKET, f'{SAVE_DIR}/{os.path.basename(output_file)}')
+        os.remove(output_file)
+
     return output_file
 
 
@@ -426,7 +444,8 @@ def main():
         threads=args.threads,
         overview_levels=args.overviews,
         no_overviews=args.no_overviews,
-        no_ibra=args.no_ibra
+        no_ibra=args.no_ibra,
+        save=args.save
     )
 
 
