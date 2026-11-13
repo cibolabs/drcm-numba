@@ -1,0 +1,44 @@
+{
+  "type": "FeatureCollection",
+  "crs": {
+    "type": "name",
+    "properties": {
+      "name": "urn:ogc:def:crs:OGC:1.3:CRS84"
+    }
+  },
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "nsw_ibra_17_58_test_aoi"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              139.9339983,
+              -29.8159521
+            ],
+            [
+              140.0217196,
+              -29.8112766
+            ],
+            [
+              140.0162088,
+              -29.736506
+            ],
+            [
+              139.9285476,
+              -29.741178
+            ],
+            [
+              139.9339983,
+              -29.8159521
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}
