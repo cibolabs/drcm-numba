@@ -180,7 +180,12 @@ def parse_args():
     p.add_argument("--threads", type=int, default=None, help="Optional Numba thread count override")
     p.add_argument("--ref-cache-dir", default="/tmp")
     p.add_argument("--work-dir", default="/tmp/drcm_work")
-    p.add_argument("--min-output-bytes", type=int, default=100_000_000)
+    p.add_argument(
+        "--min-output-bytes",
+        type=int,
+        default=None,
+        help="Minimum valid output size in bytes (default: 100000000 full-res, 1024 when --bbox/--geojson is active)",
+    )
     p.add_argument("--no-overviews", action="store_true", default=False)
     return p.parse_args()
 
@@ -205,6 +210,11 @@ def main():
 
     geojson = args.geojson if args.geojson is not None else manifest.get("geojson")
     bbox = args.bbox if args.bbox is not None else manifest.get("bbox")
+    min_output_bytes = (
+        args.min_output_bytes
+        if args.min_output_bytes is not None
+        else (1_024 if (geojson is not None or bbox is not None) else 100_000_000)
+    )
     ibra_raster = args.ibra_raster
     if ibra_raster is None and manifest.get("ibra_key"):
         ibra_key = manifest["ibra_key"]
@@ -218,7 +228,7 @@ def main():
     print(
         f"WORKER_START shard={shard_idx}/{len(shards)} seasons={len(shard_keys)} "
         f"no_ibra={args.no_ibra} chunksize={args.chunksize} minvalpercent={args.minvalpercent} "
-        f"output=s3://{bucket}/{output_prefix} | {host_info}",
+        f"min_output_bytes={min_output_bytes} output=s3://{bucket}/{output_prefix} | {host_info}",
         flush=True,
     )
 
@@ -228,7 +238,7 @@ def main():
         out_name = seasonalDRCMIbra.derive_output_name(in_key, no_ibra=args.no_ibra)
         out_key = f"{output_prefix}{out_name}"
         existing_sz = _head_s3_size(s3, bucket, out_key)
-        if existing_sz is not None and existing_sz >= args.min_output_bytes:
+        if existing_sz is not None and existing_sz >= min_output_bytes:
             print(f"SKIP_EXISTING s3://{bucket}/{out_key} ({existing_sz / 1048576.0:.1f} MB)", flush=True)
             skipped += 1
         else:
@@ -290,7 +300,7 @@ def main():
 
             # Wait for any prior season's upload before enqueueing the next so /tmp never holds >2 outputs.
             _drain_pending_upload()
-            fut = up_pool.submit(_upload_and_cleanup, local_out, bucket, out_key, args.min_output_bytes)
+            fut = up_pool.submit(_upload_and_cleanup, local_out, bucket, out_key, min_output_bytes)
             pending_upload = (out_key, fut)
             processed += 1
             print(

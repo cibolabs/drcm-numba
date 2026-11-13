@@ -7,6 +7,7 @@ Purpose:   Produces a 2-band masked long-term statistics image for IBRA-constrai
 """
 
 import os
+import re
 import sys
 import argparse
 import numpy as np
@@ -14,6 +15,46 @@ from osgeo import gdal, ogr, osr
 from rios import applier, cuiprogress
 
 gdal.UseExceptions()
+
+_STAGE_DIX_RE = re.compile(r"(?:^|[_\-.])dix", re.IGNORECASE)
+_STAGE_DP8_RE = re.compile(r"(?:^|[_\-.])dp8", re.IGNORECASE)
+
+
+def infer_bare_encoding(path):
+    """Infer bare ground encoding stage ('dixa2' vs 'dp8a2') from filename."""
+    base = os.path.basename(path or "")
+    if _STAGE_DP8_RE.search(base):
+        return "dp8a2"
+    if _STAGE_DIX_RE.search(base):
+        return "dixa2"
+    return "dixa2"
+
+
+def validate_ibra_layer_attribute(lyr, attr_name):
+    """Verify attr_name exists and all non-null feature values fit within uint8 1..255."""
+    lyr_defn = lyr.GetLayerDefn()
+    field_idx = lyr_defn.GetFieldIndex(attr_name)
+    if field_idx < 0:
+        raise ValueError(f"IBRA attribute '{attr_name}' not found in layer schema.")
+
+    lyr.ResetReading()
+    seen_any = False
+    try:
+        for feat in lyr:
+            if not feat.IsFieldSetAndNotNull(field_idx):
+                continue
+            val = int(feat.GetField(field_idx))
+            seen_any = True
+            if val <= 0 or val > 255:
+                raise ValueError(
+                    f"IBRA attribute '{attr_name}' value {val} exceeds valid 1-byte region range 1..255; "
+                    "cannot rasterize into GDT_Byte without ID corruption."
+                )
+    finally:
+        lyr.ResetReading()
+
+    if not seen_any:
+        raise ValueError(f"IBRA layer contains no non-null values for attribute '{attr_name}'.")
 
 
 def ensure_ibra_albers(ibra_vector_path, target_proj_wkt, output_albers_path=None):
@@ -29,9 +70,23 @@ def ensure_ibra_albers(ibra_vector_path, target_proj_wkt, output_albers_path=Non
         return output_albers_path
 
     print(f"Reprojecting {ibra_vector_path} to match reference projection -> {output_albers_path}...")
+    tmp_path = f"{output_albers_path}.tmp"
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
     opt = gdal.VectorTranslateOptions(dstSRS=target_proj_wkt, format="FlatGeobuf")
-    ds = gdal.VectorTranslate(output_albers_path, ibra_vector_path, options=opt)
     ds = None
+    try:
+        ds = gdal.VectorTranslate(tmp_path, ibra_vector_path, options=opt)
+        ds = None
+        os.replace(tmp_path, output_albers_path)
+    except Exception:
+        ds = None
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
     return output_albers_path
 
 
@@ -39,38 +94,49 @@ def maskStatsIbra(info, inputs, outputs, otherArgs):
     """
     RIOS block callback:
       - Band 1: Bare ground 95th/max stats masked by clearing and slope.
-      - Band 2: Rasterized IBRA region code (OBJECTID 1..89).
+      - Band 2: Rasterized IBRA region code (1..255).
     """
-    nullValBare = 0
+    bare = inputs.bareStats[6]
     (nRows, nCols) = inputs.terrainData.shape[1:]
     outImage = np.zeros((2, nRows, nCols), dtype=np.uint8)
 
-    # Ocean / Background fast-path: if block has no valid bare ground, return empty immediately
-    if not np.any(inputs.bareStats[6] > 0):
-        outputs.dcrmMask = outImage
-        return
+    nullValBare = getattr(otherArgs, "nullValBare", None)
+    bare_encoding = getattr(otherArgs, "bare_encoding", "dixa2")
 
-    # Band 1: Bare ground masked by clearing and slope:
-    # 1. NCAS Woody Extent: changeData[0] is Woody Max (0=non-woody, 1=woodland, 2=forest).
-    #    We exclude Class 2 (forest, canopy cover >20%) to ensure reference sites reflect
-    #    open rangeland and grazing pasture rather than closed woody canopy unmixing.
-    # 2. Historical Clearing: changeData[2] is clearing history (1=cleared). Excluded to prevent
-    #    disturbed / cleared tracts from skewing persistent reference condition.
-    # 3. Slope Relief: terrainData[0] < 39 masks terrain based on Speight (2009) Table 5
-    #    (CSIRO/GA Slope-Relief). Tens digit is median slope: 10 (<1%), 20 (1-3%), 30 (3-10%),
-    #    40 (10-32%), 50 (32-56%), 60 (56-100%), 70 (>100%). Classes < 39 keep only level,
-    #    gently inclined, and undulating plains/rises/low hills (<10% slope), excluding
-    #    moderately sloping, rolling, steep, mountainous relief (>=10% slope), and badlands.
-    # 4. Long-term Bare: bareStats[6] (Band 7) is maximum bare ground across 1989-2020.
-    #    Scaled to reference groundcover + 1 (1..101 range, 0 = NoData).
-    outImage[0] = np.clip(np.where(
-        (inputs.changeData[0] != 2) & # Exclude forest
-        (inputs.changeData[2] != 1) & # Exclude historically cleared
-        (inputs.terrainData[0] < 39) & # Exclude slope classes >= 40 (median slope >= 10%)
-        (inputs.bareStats[6] != nullValBare), # Valid bare stats
-        201 - inputs.bareStats[6], 0), 0, 101)
+    # Mask valid bare domain strictly before int16 subtraction so invalid uint8 values
+    # (e.g. 202..255 under NumPy 2 NEP-50) can never underflow and clip to 101.
+    if bare_encoding == "dp8a2":
+        valid_bare = bare <= 100
+        offset_top = 101
+    else:
+        valid_bare = (bare >= 100) & (bare <= 200)
+        offset_top = 201
+    if nullValBare is not None:
+        try:
+            nd = int(round(float(nullValBare)))
+            if float(nullValBare) == nd and 0 <= nd <= 255:
+                valid_bare &= bare != np.uint8(nd)
+        except (TypeError, ValueError, OverflowError):
+            pass
 
-    # Band 2: Rasterize IBRA region code for this exact block in memory
+    if np.any(valid_bare):
+        # Band 1: Bare ground masked by clearing and slope:
+        # 1. NCAS Woody Extent: changeData[0] is Woody Max (0=non-woody, 1=woodland, 2=forest).
+        #    Exclude Class 2 (forest, canopy cover >20%).
+        # 2. Historical Clearing: changeData[2] is clearing history (1=cleared).
+        # 3. Slope Relief: terrainData[0] < 39 keeps slope < 10% (Speight 2009 Table 5).
+        # 4. Long-term Bare: scaled to persistent groundcover + 1 (1..101, 0 = NoData).
+        valid_mask = (
+            (inputs.changeData[0] != 2)
+            & (inputs.changeData[2] != 1)
+            & (inputs.terrainData[0] < 39)
+            & valid_bare
+        )
+        gc_i16 = offset_top - bare.astype(np.int16)
+        outImage[0] = np.where(valid_mask, np.clip(gc_i16, 1, 101), 0).astype(np.uint8)
+
+    # Band 2: Rasterize IBRA region code whenever block intersects vector features
+    # (preserves IBRA polygons over land holes where bareStats == 0).
     grid_gt = info.getTransform()
     col_in_grid, row_in_grid = info.getPixColRow(0, 0)
     xRes, yRes = grid_gt[1], grid_gt[5]
@@ -85,23 +151,22 @@ def maskStatsIbra(info, inputs, outputs, otherArgs):
     yMax_b = max(tl_y, br_y)
 
     ext = otherArgs.extent
-    # Check if block intersects IBRA vector bounding box
     if not (xMax_b < ext[0] or xMin_b > ext[1] or yMax_b < ext[2] or yMin_b > ext[3]):
         otherArgs.lyr.SetSpatialFilterRect(xMin_b, yMin_b, xMax_b, yMax_b)
+        if otherArgs.lyr.GetFeatureCount() > 0:
+            if nCols == otherArgs.mem_ds.RasterXSize and nRows == otherArgs.mem_ds.RasterYSize:
+                mem_ds = otherArgs.mem_ds
+                mem_band = otherArgs.mem_band
+            else:
+                mem_ds = otherArgs.mem_driver.Create("", nCols, nRows, 1, gdal.GDT_Byte)
+                mem_ds.SetProjection(otherArgs.proj)
+                mem_band = mem_ds.GetRasterBand(1)
 
-        # Reuse preallocated in-memory dataset when dimensions match standard block size
-        if nCols == otherArgs.mem_ds.RasterXSize and nRows == otherArgs.mem_ds.RasterYSize:
-            mem_ds = otherArgs.mem_ds
-            mem_band = otherArgs.mem_band
-        else:
-            mem_ds = otherArgs.mem_driver.Create("", nCols, nRows, 1, gdal.GDT_Byte)
-            mem_ds.SetProjection(otherArgs.proj)
-            mem_band = mem_ds.GetRasterBand(1)
-
-        mem_ds.SetGeoTransform((tl_x, xRes, 0, tl_y, 0, yRes))
-        mem_band.Fill(0)
-        gdal.RasterizeLayer(mem_ds, [1], otherArgs.lyr, options=["ATTRIBUTE=OBJECTID"])
-        outImage[1] = mem_band.ReadAsArray()
+            mem_ds.SetGeoTransform((tl_x, xRes, 0, tl_y, 0, yRes))
+            mem_band.Fill(0)
+            ibra_attr = getattr(otherArgs, "ibra_attr", "OBJECTID")
+            gdal.RasterizeLayer(mem_ds, [1], otherArgs.lyr, options=[f"ATTRIBUTE={ibra_attr}"])
+            outImage[1] = mem_band.ReadAsArray()
 
     outputs.dcrmMask = outImage
 
@@ -112,6 +177,13 @@ def parse_args():
     parser.add_argument("--terrain", default="slope_relief_class_3s.tif", help="Slope relief raster")
     parser.add_argument("--bare", default="lztmre_aus_m198912202012_dixa2_bareStats.tif", help="Bare stats raster")
     parser.add_argument("--ibra", default="ibra.fgb", help="IBRA vector dataset")
+    parser.add_argument("--ibra-attr", default="OBJECTID", help="Vector attribute for 1..255 region code (default: OBJECTID)")
+    parser.add_argument(
+        "--bare-encoding",
+        choices=("auto", "dixa2", "dp8a2"),
+        default="auto",
+        help="Bare stats scaling stage (default: infer dp8 vs dix from --bare filename)",
+    )
     parser.add_argument("-o", "--output", default="lztmre_aus_m198912202012_dixa2_change_slope2_ibra.tif", help="Output GeoTIFF")
     parser.add_argument("--test-chip", nargs=4, type=int, metavar=("XOFF", "YOFF", "W", "H"), help="Test chip window")
     return parser.parse_args()
@@ -129,15 +201,31 @@ def main():
     infiles.bareStats = args.bare
     outfiles.dcrmMask = args.output
 
-    # Inspect reference dataset
+    # Inspect reference dataset and release GDAL handle cleanly
     ref_ds = gdal.Open(infiles.bareStats, gdal.GA_ReadOnly)
+    if ref_ds.RasterCount < 7:
+        ref_count = ref_ds.RasterCount
+        ref_ds = None
+        raise ValueError(f"Expected >= 7 bands in bare stats raster {infiles.bareStats}, got {ref_count}")
     target_proj = ref_ds.GetProjection()
     ref_gt = ref_ds.GetGeoTransform()
+    ref_w, ref_h = ref_ds.RasterXSize, ref_ds.RasterYSize
+    null_val_bare = ref_ds.GetRasterBand(7).GetNoDataValue()
+    ref_ds = None
 
-    # Reproject IBRA vector to Australian Albers if needed
+    otherArgs.nullValBare = null_val_bare
+    otherArgs.bare_encoding = (
+        infer_bare_encoding(args.bare) if args.bare_encoding == "auto" else args.bare_encoding
+    )
+    otherArgs.ibra_attr = args.ibra_attr
+
+    # Reproject IBRA vector to Australian Albers if needed and validate 1..255 attribute bounds
     ibra_albers_path = ensure_ibra_albers(args.ibra, target_proj)
     vec_ds = ogr.Open(ibra_albers_path, 0)
+    if vec_ds is None:
+        raise ValueError(f"Could not open IBRA vector dataset: {ibra_albers_path}")
     otherArgs.lyr = vec_ds.GetLayer(0)
+    validate_ibra_layer_attribute(otherArgs.lyr, args.ibra_attr)
     otherArgs.proj = target_proj
     otherArgs.extent = otherArgs.lyr.GetExtent()
 
@@ -167,6 +255,11 @@ def main():
 
     if args.test_chip:
         xoff_t, yoff_t, w_t, h_t = args.test_chip
+        if xoff_t < 0 or yoff_t < 0 or w_t <= 0 or h_t <= 0 or (xoff_t + w_t) > ref_w or (yoff_t + h_t) > ref_h:
+            vec_ds = None
+            raise ValueError(
+                f"--test-chip {(xoff_t, yoff_t, w_t, h_t)} out of bounds for {ref_w}x{ref_h}"
+            )
         xmin = ref_gt[0] + xoff_t * ref_gt[1]
         ymax = ref_gt[3] + yoff_t * ref_gt[5]
         ymin = ymax + h_t * ref_gt[5]
@@ -177,8 +270,9 @@ def main():
         )
         controls.setReferencePixgrid(grid)
 
-    print(f"Applying maskStatsIbra -> {args.output}...")
+    print(f"Applying maskStatsIbra (bare_encoding={otherArgs.bare_encoding}, ibra_attr={args.ibra_attr}) -> {args.output}...")
     applier.apply(maskStatsIbra, infiles, outfiles, otherArgs, controls=controls)
+    vec_ds = None
 
     # Set band descriptions
     out_ds = gdal.Open(args.output, gdal.GA_Update)

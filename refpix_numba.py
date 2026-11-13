@@ -34,8 +34,8 @@ def _bounds_fast(histogram, total_cnt, n, lq, uq):
 @njit(fastmath=False)
 def _calcmean(drysum, dryhist, lowerb, upperb):
     """Calculate integer mean groundcover within quantile bounds."""
-    nsum = 0
-    bigsum = 0
+    nsum = np.int64(0)
+    bigsum = np.int64(0)
     for i in range(lowerb, upperb + 1):
         if 0 <= i + 1 < len(dryhist):
             nsum += dryhist[i + 1]
@@ -62,9 +62,11 @@ def _build_valid_blocks(cover, ground, bsize):
             for r in range(r0, r1):
                 for c in range(c0, c1):
                     pv = cover[r, c]
-                    if 0 < pv <= 101 and ground[r, c] > 0:
-                        found = np.uint8(1)
-                        break
+                    if 0 < pv <= 101:
+                        dv = ground[r, c]
+                        if 0 < dv <= 101:
+                            found = np.uint8(1)
+                            break
                 if found != 0:
                     break
             blk[br, bc] = found
@@ -134,9 +136,10 @@ def _fill_empty_tile(out, r0, r1, c0, c1, r_start, c_start, halfwindow, nrow, nc
                 out[orow, c - c_start] = -1
 
 
-def _make_kernel(col_hist_dtype):
-    """Compile a tiled sliding-window Numba kernel for the requested column histogram dtype."""
+def _make_kernel(col_hist_dtype, sum_dtype=np.int32, tot_dtype=np.int32):
+    """Compile a tiled sliding-window Numba kernel for requested histogram/sum dtypes."""
     one = col_hist_dtype(1)
+    zero_tot = tot_dtype(0)
 
     @njit(fastmath=False)
     def _process_tile(
@@ -165,9 +168,9 @@ def _make_kernel(col_hist_dtype):
         # for 16-byte SIMD alignment and L2 cache locality.
         col_perc = np.zeros((tile_cols, 104), dtype=col_hist_dtype)
         col_dryhist = np.zeros((tile_cols, 104), dtype=col_hist_dtype)
-        col_drysum = np.zeros((tile_cols, 104), dtype=np.int32)
-        col_perc_tot = np.zeros(tile_cols, dtype=np.int32)
-        col_valid_tot = np.zeros(tile_cols, dtype=np.int32)
+        col_drysum = np.zeros((tile_cols, 104), dtype=sum_dtype)
+        col_perc_tot = np.zeros(tile_cols, dtype=tot_dtype)
+        col_valid_tot = np.zeros(tile_cols, dtype=tot_dtype)
 
         top_init = max(0, r0 - halfwindow)
         bot_init = min(nrow - 1, r0 + halfwindow)
@@ -179,17 +182,17 @@ def _make_kernel(col_hist_dtype):
                     col_perc[tc, pv] += one
                     col_perc_tot[tc] += 1
                     dv = ground[rr, cc]
-                    if dv > 0:
+                    if 0 < dv <= 101:
                         col_dryhist[tc, pv] += one
                         col_drysum[tc, pv] += dv
                         col_valid_tot[tc] += 1
 
-        percentilehist = np.zeros(104, dtype=np.int32)
-        dryhist = np.zeros(104, dtype=np.int32)
-        drysum = np.zeros(104, dtype=np.int32)
+        percentilehist = np.zeros(104, dtype=tot_dtype)
+        dryhist = np.zeros(104, dtype=tot_dtype)
+        drysum = np.zeros(104, dtype=sum_dtype)
 
-        perc_tot = 0
-        validpixels = 0
+        perc_tot = zero_tot
+        validpixels = zero_tot
         act_c0 = max(0, c0 - halfwindow)
         act_c1 = min(ncol, c0 + halfwindow + 1)
         for cc in range(act_c0, act_c1):
@@ -201,12 +204,12 @@ def _make_kernel(col_hist_dtype):
                 if vt > 0:
                     validpixels += vt
                     for b in range(104):
-                        percentilehist[b] += np.int32(col_perc[tc, b])
-                        dryhist[b] += np.int32(col_dryhist[tc, b])
+                        percentilehist[b] += tot_dtype(col_perc[tc, b])
+                        dryhist[b] += tot_dtype(col_dryhist[tc, b])
                         drysum[b] += col_drysum[tc, b]
                 else:
                     for b in range(104):
-                        percentilehist[b] += np.int32(col_perc[tc, b])
+                        percentilehist[b] += tot_dtype(col_perc[tc, b])
 
         # Serpentine row sweep preserves the active 2D histogram at row turnarounds,
         # eliminating per-row column histogram clearing and re-summation.
@@ -234,7 +237,7 @@ def _make_kernel(col_hist_dtype):
                                 perc_tot -= 1
                                 percentilehist[pv] -= 1
                             dv = ground[rem_r, cc]
-                            if dv > 0:
+                            if 0 < dv <= 101:
                                 col_dryhist[tc, pv] -= one
                                 col_drysum[tc, pv] -= dv
                                 col_valid_tot[tc] -= 1
@@ -256,7 +259,7 @@ def _make_kernel(col_hist_dtype):
                                 perc_tot += 1
                                 percentilehist[pv] += 1
                             dv = ground[add_r, cc]
-                            if dv > 0:
+                            if 0 < dv <= 101:
                                 col_dryhist[tc, pv] += one
                                 col_drysum[tc, pv] += dv
                                 col_valid_tot[tc] += 1
@@ -298,12 +301,12 @@ def _make_kernel(col_hist_dtype):
                                 if vt > 0:
                                     validpixels -= vt
                                     for b in range(104):
-                                        percentilehist[b] -= np.int32(col_perc[tc, b])
-                                        dryhist[b] -= np.int32(col_dryhist[tc, b])
+                                        percentilehist[b] -= tot_dtype(col_perc[tc, b])
+                                        dryhist[b] -= tot_dtype(col_dryhist[tc, b])
                                         drysum[b] -= col_drysum[tc, b]
                                 else:
                                     for b in range(104):
-                                        percentilehist[b] -= np.int32(col_perc[tc, b])
+                                        percentilehist[b] -= tot_dtype(col_perc[tc, b])
                         next_right_c = (c + 1) + halfwindow
                         if next_right_c < ncol:
                             tc = next_right_c - w_c0
@@ -314,12 +317,12 @@ def _make_kernel(col_hist_dtype):
                                 if vt > 0:
                                     validpixels += vt
                                     for b in range(104):
-                                        percentilehist[b] += np.int32(col_perc[tc, b])
-                                        dryhist[b] += np.int32(col_dryhist[tc, b])
+                                        percentilehist[b] += tot_dtype(col_perc[tc, b])
+                                        dryhist[b] += tot_dtype(col_dryhist[tc, b])
                                         drysum[b] += col_drysum[tc, b]
                                 else:
                                     for b in range(104):
-                                        percentilehist[b] += np.int32(col_perc[tc, b])
+                                        percentilehist[b] += tot_dtype(col_perc[tc, b])
                 forward = False
             else:
                 for c in range(c1 - 1, c0 - 1, -1):
@@ -349,12 +352,12 @@ def _make_kernel(col_hist_dtype):
                                 if vt > 0:
                                     validpixels -= vt
                                     for b in range(104):
-                                        percentilehist[b] -= np.int32(col_perc[tc, b])
-                                        dryhist[b] -= np.int32(col_dryhist[tc, b])
+                                        percentilehist[b] -= tot_dtype(col_perc[tc, b])
+                                        dryhist[b] -= tot_dtype(col_dryhist[tc, b])
                                         drysum[b] -= col_drysum[tc, b]
                                 else:
                                     for b in range(104):
-                                        percentilehist[b] -= np.int32(col_perc[tc, b])
+                                        percentilehist[b] -= tot_dtype(col_perc[tc, b])
                         prev_left_c = (c - 1) - halfwindow
                         if prev_left_c >= 0:
                             tc = prev_left_c - w_c0
@@ -365,12 +368,12 @@ def _make_kernel(col_hist_dtype):
                                 if vt > 0:
                                     validpixels += vt
                                     for b in range(104):
-                                        percentilehist[b] += np.int32(col_perc[tc, b])
-                                        dryhist[b] += np.int32(col_dryhist[tc, b])
+                                        percentilehist[b] += tot_dtype(col_perc[tc, b])
+                                        dryhist[b] += tot_dtype(col_dryhist[tc, b])
                                         drysum[b] += col_drysum[tc, b]
                                 else:
                                     for b in range(104):
-                                        percentilehist[b] += np.int32(col_perc[tc, b])
+                                        percentilehist[b] += tot_dtype(col_perc[tc, b])
                 forward = True
 
     @njit(parallel=True, fastmath=False)
@@ -452,8 +455,9 @@ def _make_kernel(col_hist_dtype):
     return _run_tiled
 
 
-_KERNEL_U16 = _make_kernel(np.uint16)
-_KERNEL_I32 = _make_kernel(np.int32)
+_KERNEL_U16 = _make_kernel(np.uint16, np.int32, np.int32)
+_KERNEL_U16_I64 = _make_kernel(np.uint16, np.int64, np.int64)
+_KERNEL_I32 = _make_kernel(np.int32, np.int64, np.int64)
 
 
 def refpixelfilternodata(
@@ -485,7 +489,12 @@ def refpixelfilternodata(
         r0 = r1
     if c0 > c1:
         c0 = c1
-    kernel = _KERNEL_U16 if window <= 65535 else _KERNEL_I32
+    if window <= 4611:
+        kernel = _KERNEL_U16
+    elif window <= 65535:
+        kernel = _KERNEL_U16_I64
+    else:
+        kernel = _KERNEL_I32
     return kernel(
         cover,
         ground,

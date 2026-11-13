@@ -43,8 +43,8 @@ def _calcmean(drysum, dryhist, lowerb, upperb):
     Calculate mean groundcover within quantile bounds matching Fortran calcmean().
     Array lookups match Fortran dryhist(i+1) and drysum(i+1).
     """
-    nsum = 0
-    bigsum = 0
+    nsum = np.int64(0)
+    bigsum = np.int64(0)
     for i in range(lowerb, upperb + 1):
         if 0 <= i + 1 < len(dryhist):
             nsum += dryhist[i + 1]
@@ -102,9 +102,11 @@ def _build_ibra_nonzero_blocks(ibra, cover, ground, bsize):
                     if reg > 0:
                         has_reg = True
                         pv = cover[r, c]
-                        if 0 < pv <= 101 and ground[r, c] > 0:
-                            has_valid = True
-                            break
+                        if 0 < pv <= 101:
+                            dv = ground[r, c]
+                            if 0 < dv <= 101:
+                                has_valid = True
+                                break
                 if has_valid:
                     break
             v = np.uint8(0)
@@ -193,12 +195,13 @@ def _scan_core_regions_2d(ibra, r0, r1, c0, c1):
     return k, local_regs, reg_rmin, reg_rmax, reg_cmin, reg_cmax
 
 
-def _make_ibra_kernel(col_hist_dtype, nbins=104):
+def _make_ibra_kernel(col_hist_dtype, sum_dtype=np.int32, tot_dtype=np.int32, nbins=104):
     """
     Build a Serpentine 2D tiled IBRA reference pixel kernel parameterized by column
-    histogram dtype (uint16 when window <= 65535 for ~2x cache efficiency, int32 fallback).
+    histogram and sum dtypes (uint16+int32 when window <= 4611, int64 sums above).
     """
     one = col_hist_dtype(1)
+    zero_tot = tot_dtype(0)
 
     @njit(fastmath=False)
     def _tile_single_region_serp(
@@ -214,10 +217,10 @@ def _make_ibra_kernel(col_hist_dtype, nbins=104):
 
         col_perc = np.zeros((tile_cols, nbins), dtype=col_hist_dtype)
         col_dryhist = np.zeros((tile_cols, nbins), dtype=col_hist_dtype)
-        col_drysum = np.zeros((tile_cols, nbins), dtype=np.int32)
-        col_reg_tot = np.zeros(tile_cols, dtype=np.int32)
-        col_perc_tot = np.zeros(tile_cols, dtype=np.int32)
-        col_valid_tot = np.zeros(tile_cols, dtype=np.int32)
+        col_drysum = np.zeros((tile_cols, nbins), dtype=sum_dtype)
+        col_reg_tot = np.zeros(tile_cols, dtype=tot_dtype)
+        col_perc_tot = np.zeros(tile_cols, dtype=tot_dtype)
+        col_valid_tot = np.zeros(tile_cols, dtype=tot_dtype)
 
         top_init = max(0, r0 - halfwindow)
         bot_init = min(nrow - 1, r0 + halfwindow)
@@ -231,18 +234,18 @@ def _make_ibra_kernel(col_hist_dtype, nbins=104):
                         col_perc[tc, pv] += one
                         col_perc_tot[tc] += 1
                         dv = ground[rr, cc]
-                        if dv > 0:
+                        if 0 < dv <= 101:
                             col_dryhist[tc, pv] += one
                             col_drysum[tc, pv] += dv
                             col_valid_tot[tc] += 1
 
-        percentilehist = np.zeros(nbins, dtype=np.int32)
-        dryhist = np.zeros(nbins, dtype=np.int32)
-        drysum = np.zeros(nbins, dtype=np.int32)
+        percentilehist = np.zeros(nbins, dtype=tot_dtype)
+        dryhist = np.zeros(nbins, dtype=tot_dtype)
+        drysum = np.zeros(nbins, dtype=sum_dtype)
 
-        n_reg_pixels = 0
-        perc_tot = 0
-        v_reg_pixels = 0
+        n_reg_pixels = zero_tot
+        perc_tot = zero_tot
+        v_reg_pixels = zero_tot
         act_c0 = max(0, c0 - halfwindow)
         act_c1 = min(ncol, c0 + halfwindow + 1)
         for cc in range(act_c0, act_c1):
@@ -257,12 +260,12 @@ def _make_ibra_kernel(col_hist_dtype, nbins=104):
                     if vt > 0:
                         v_reg_pixels += vt
                         for b in range(nbins):
-                            percentilehist[b] += np.int32(col_perc[tc, b])
-                            dryhist[b] += np.int32(col_dryhist[tc, b])
+                            percentilehist[b] += tot_dtype(col_perc[tc, b])
+                            dryhist[b] += tot_dtype(col_dryhist[tc, b])
                             drysum[b] += col_drysum[tc, b]
                     else:
                         for b in range(nbins):
-                            percentilehist[b] += np.int32(col_perc[tc, b])
+                            percentilehist[b] += tot_dtype(col_perc[tc, b])
 
         # Serpentine row sweep preserves the active 2D histogram at row turnarounds,
         # eliminating per-row 1501-column histogram clearing and re-summation.
@@ -294,7 +297,7 @@ def _make_ibra_kernel(col_hist_dtype, nbins=104):
                                     perc_tot -= 1
                                     percentilehist[pv] -= 1
                                 dv = ground[rem_r, cc]
-                                if dv > 0:
+                                if 0 < dv <= 101:
                                     col_dryhist[tc, pv] -= one
                                     col_drysum[tc, pv] -= dv
                                     col_valid_tot[tc] -= 1
@@ -320,7 +323,7 @@ def _make_ibra_kernel(col_hist_dtype, nbins=104):
                                     perc_tot += 1
                                     percentilehist[pv] += 1
                                 dv = ground[add_r, cc]
-                                if dv > 0:
+                                if 0 < dv <= 101:
                                     col_dryhist[tc, pv] += one
                                     col_drysum[tc, pv] += dv
                                     col_valid_tot[tc] += 1
@@ -356,12 +359,12 @@ def _make_ibra_kernel(col_hist_dtype, nbins=104):
                                     if vt > 0:
                                         v_reg_pixels -= vt
                                         for b in range(nbins):
-                                            percentilehist[b] -= np.int32(col_perc[tc, b])
-                                            dryhist[b] -= np.int32(col_dryhist[tc, b])
+                                            percentilehist[b] -= tot_dtype(col_perc[tc, b])
+                                            dryhist[b] -= tot_dtype(col_dryhist[tc, b])
                                             drysum[b] -= col_drysum[tc, b]
                                     else:
                                         for b in range(nbins):
-                                            percentilehist[b] -= np.int32(col_perc[tc, b])
+                                            percentilehist[b] -= tot_dtype(col_perc[tc, b])
                         next_right_c = (c + 1) + halfwindow
                         if next_right_c < ncol:
                             tc = next_right_c - w_c0
@@ -375,12 +378,12 @@ def _make_ibra_kernel(col_hist_dtype, nbins=104):
                                     if vt > 0:
                                         v_reg_pixels += vt
                                         for b in range(nbins):
-                                            percentilehist[b] += np.int32(col_perc[tc, b])
-                                            dryhist[b] += np.int32(col_dryhist[tc, b])
+                                            percentilehist[b] += tot_dtype(col_perc[tc, b])
+                                            dryhist[b] += tot_dtype(col_dryhist[tc, b])
                                             drysum[b] += col_drysum[tc, b]
                                     else:
                                         for b in range(nbins):
-                                            percentilehist[b] += np.int32(col_perc[tc, b])
+                                            percentilehist[b] += tot_dtype(col_perc[tc, b])
                 forward = False
             else:
                 for c in range(c1 - 1, c0 - 1, -1):
@@ -408,12 +411,12 @@ def _make_ibra_kernel(col_hist_dtype, nbins=104):
                                     if vt > 0:
                                         v_reg_pixels -= vt
                                         for b in range(nbins):
-                                            percentilehist[b] -= np.int32(col_perc[tc, b])
-                                            dryhist[b] -= np.int32(col_dryhist[tc, b])
+                                            percentilehist[b] -= tot_dtype(col_perc[tc, b])
+                                            dryhist[b] -= tot_dtype(col_dryhist[tc, b])
                                             drysum[b] -= col_drysum[tc, b]
                                     else:
                                         for b in range(nbins):
-                                            percentilehist[b] -= np.int32(col_perc[tc, b])
+                                            percentilehist[b] -= tot_dtype(col_perc[tc, b])
                         prev_left_c = (c - 1) - halfwindow
                         if prev_left_c >= 0:
                             tc = prev_left_c - w_c0
@@ -427,12 +430,12 @@ def _make_ibra_kernel(col_hist_dtype, nbins=104):
                                     if vt > 0:
                                         v_reg_pixels += vt
                                         for b in range(nbins):
-                                            percentilehist[b] += np.int32(col_perc[tc, b])
-                                            dryhist[b] += np.int32(col_dryhist[tc, b])
+                                            percentilehist[b] += tot_dtype(col_perc[tc, b])
+                                            dryhist[b] += tot_dtype(col_dryhist[tc, b])
                                             drysum[b] += col_drysum[tc, b]
                                     else:
                                         for b in range(nbins):
-                                            percentilehist[b] += np.int32(col_perc[tc, b])
+                                            percentilehist[b] += tot_dtype(col_perc[tc, b])
                 forward = True
 
     @njit(parallel=True, fastmath=False)
@@ -503,8 +506,9 @@ def _make_ibra_kernel(col_hist_dtype, nbins=104):
     return _run
 
 
-_IBRA_KERNEL_U16 = _make_ibra_kernel(np.uint16, 104)
-_IBRA_KERNEL_I32 = _make_ibra_kernel(np.int32, 104)
+_IBRA_KERNEL_U16 = _make_ibra_kernel(np.uint16, np.int32, np.int32, 104)
+_IBRA_KERNEL_U16_I64 = _make_ibra_kernel(np.uint16, np.int64, np.int64, 104)
+_IBRA_KERNEL_I32 = _make_ibra_kernel(np.int32, np.int64, np.int64, 104)
 
 
 def refpixelfilter_ibra(
@@ -579,7 +583,12 @@ def refpixelfilter_ibra(
     if c_start > c_stop:
         c_start = c_stop
 
-    kernel = _IBRA_KERNEL_U16 if window <= 65535 else _IBRA_KERNEL_I32
+    if window <= 4611:
+        kernel = _IBRA_KERNEL_U16
+    elif window <= 65535:
+        kernel = _IBRA_KERNEL_U16_I64
+    else:
+        kernel = _IBRA_KERNEL_I32
     return kernel(
         cover, ground, ibra,
         window, lowerquantile, upperquantile, minvalpercent,

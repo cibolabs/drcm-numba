@@ -42,6 +42,7 @@ os.chdir(REPO_ROOT)
 
 import refpix_numba
 import refpix_numba_ibra
+import maskChangeSteepIbra
 import run_aus_batch_worker
 import seasonalDRCMIbra
 import submit_batch_jobs
@@ -53,6 +54,7 @@ from seasonalDRCMIbra import (
     convert_to_groundcover,
     derive_output_name,
     format_time,
+    infer_bare_encoding_from_filename,
     run_seasonal_drcm_ibra,
 )
 
@@ -109,7 +111,7 @@ def _oracle_refpixel(
                     continue
                 vc = sub_cov[mask_reg]
                 vg = sub_gnd[mask_reg]
-                n_valid = int(np.sum((vc > 0) & (vc <= 101) & (vg > 0)))
+                n_valid = int(np.sum((vc > 0) & (vc <= 101) & (vg > 0) & (vg <= 101)))
                 if n_valid == 0 or n_valid < float(np.float32(minvalpercent)) * n_reg:
                     out[oi, oj] = -1
                     continue
@@ -124,7 +126,7 @@ def _oracle_refpixel(
                     npix = (bot_f - top_f) * window
                 vc = sub_cov.ravel()
                 vg = sub_gnd.ravel()
-                n_valid = int(np.sum((vc > 0) & (vc <= 101) & (vg > 0)))
+                n_valid = int(np.sum((vc > 0) & (vc <= 101) & (vg > 0) & (vg <= 101)))
                 if n_valid < float(np.float32(minvalpercent)) * npix:
                     out[oi, oj] = -1
                     continue
@@ -147,7 +149,7 @@ def _oracle_refpixel(
                 if cnt_le < lv:
                     b0 = cand
                     break
-            in_band = (vc >= b0 + 1) & (vc <= b1 + 1) & (vg > 0)
+            in_band = (vc >= b0 + 1) & (vc <= b1 + 1) & (vg > 0) & (vg <= 101)
             nsum = int(np.sum(in_band))
             out[oi, oj] = 0 if nsum == 0 else int(np.sum(vg[in_band].astype(np.int64))) // nsum
     return out
@@ -246,7 +248,19 @@ def test_2_groundcover_conversion():
     assert np.all(convert_to_groundcover(np.full((10, 10), 255, dtype=np.uint8), nodata_val=255) == 0)
     empty_gc = convert_to_groundcover(np.empty((0, 0), dtype=np.uint8), nodata_val=255, inplace=True)
     assert empty_gc.shape == (0, 0) and empty_gc.dtype == np.int8
-    print(">>> PASS: Groundcover LUT, in-place, fallback, and edge cases verified!")
+
+    # H1 hardening: dixa2 containing NoData=255 (uint8 inplace & fallback) + int16 negatives + filename stage
+    dixa_with_255 = np.array([[100, 150, 200], [120, 180, 255]], dtype=np.uint8)
+    expected_dixa_255 = np.array([[101, 51, 1], [81, 21, 0]], dtype=np.int8)
+    assert np.array_equal(convert_to_groundcover(dixa_with_255.copy(), nodata_val=255, inplace=True), expected_dixa_255)
+    assert np.array_equal(convert_to_groundcover(dixa_with_255, nodata_val=None), expected_dixa_255)
+    assert np.array_equal(convert_to_groundcover(dixa_with_255.astype(np.uint16), nodata_val=255), expected_dixa_255)
+    neg_i16 = np.array([[-9999, 0, 50, 100]], dtype=np.int16)
+    assert np.array_equal(convert_to_groundcover(neg_i16, nodata_val=255), np.array([[0, 101, 51, 1]], dtype=np.int8))
+    assert infer_bare_encoding_from_filename("/tmp/dp8_dir/lztmre_aus_m202001_dixa2.tif") == "dixa2"
+    assert infer_bare_encoding_from_filename("s3://bucket/GC/lztmre_aus_m202606202608_dp8a2_vinterim.tif") == "dp8a2"
+    assert infer_bare_encoding_from_filename("/tmp/custom_input.tif") is None
+    print(">>> PASS: Groundcover LUT, in-place, filename stage, fallback, and H1 edge cases verified!")
 
 
 def test_3_quantile_bounds_and_mean():
@@ -931,7 +945,97 @@ def test_11_batch_worker_and_submission():
             run_aus_batch_worker._build_s3_client = orig_build_s3
             run_aus_batch_worker._ensure_local_ref_cache = orig_cache_fn
             seasonalDRCMIbra.run_seasonal_drcm_ibra = orig_run
-    print(">>> PASS: Batch submission, --save, and worker GeoTIFF output contents verified!")
+
+        # 5. Verify H4 (test_data/ staging), M1 (AOI min_output_bytes default), and M3 (tail startFromHead=False)
+        staged_keys = []
+
+        class _FakeStageS3:
+            def upload_file(self, Filename, Bucket, Key):
+                assert os.path.isfile(Filename)
+                staged_keys.append((Bucket, Key))
+
+            def put_object(self, Bucket, Key, Body, ContentType=None):
+                staged_keys.append((Bucket, Key))
+
+        submit_batch_jobs.stage_scripts_and_manifest(
+            _FakeStageS3(), REPO_ROOT, "test-bucket", "DRCM/_batch_scripts/smoke", manifest,
+            include_test_data=True, require_test_data=True,
+        )
+        staged_rel = {k for _, k in staged_keys}
+        assert "DRCM/_batch_scripts/smoke/test_data/lztmre_aus_m202606202608_dp8a2_vinterim.tif" in staged_rel
+        assert "DRCM/_batch_scripts/smoke/test_data/lztmre_aus_m198912202012_dixa2_change_slope_ibra.tif" in staged_rel
+
+        cw_calls = []
+
+        class _FakeLogs:
+            def get_log_events(self, **kw):
+                cw_calls.append(kw)
+                return {"events": [{"message": "Traceback tail line"}], "nextForwardToken": "tok2"}
+
+        _, tail_msgs = submit_batch_jobs._tail_cloudwatch(
+            _FakeLogs(), "/aws/batch/test", "stream/1", None, start_from_head=False, limit=50
+        )
+        assert cw_calls[0]["startFromHead"] is False and cw_calls[0]["limit"] == 50
+        assert tail_msgs == ["Traceback tail line"]
+
+        # M1: bbox manifest without --min-output-bytes accepts compact sub-100MB AOI output
+        aoi_manifest_path = os.path.join(tmpdir, "aoi_manifest.json")
+        with open(aoi_manifest_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "bucket": "test-bucket",
+                    "ref_key": "DRCM/ref.tif",
+                    "output_prefix": "DRCM/aoi/",
+                    "bbox": [0.0, -3000.0, 3000.0, 0.0],
+                    "shards": [[in2]],
+                },
+                f,
+            )
+        uploaded_aoi = {}
+
+        class _FakeAoiS3:
+            def head_object(self, Bucket, Key):
+                if Key in uploaded_aoi:
+                    return {"ContentLength": uploaded_aoi[Key]}
+                raise FileNotFoundError(Key)
+
+            def upload_file(self, Filename, Bucket, Key, Config=None):
+                uploaded_aoi[Key] = os.path.getsize(Filename)
+
+        orig_build_s3 = run_aus_batch_worker._build_s3_client
+        orig_cache_fn = run_aus_batch_worker._ensure_local_ref_cache
+        orig_run = seasonalDRCMIbra.run_seasonal_drcm_ibra
+        orig_argv = sys.argv
+        try:
+            run_aus_batch_worker._build_s3_client = lambda: _FakeAoiS3()
+            run_aus_batch_worker._ensure_local_ref_cache = lambda s3, b, k, d: (ref_tif, False)
+
+            def _wrapped_aoi(**kw):
+                ig = kw["input_groundcover"]
+                if ig.startswith("s3://test-bucket/"):
+                    kw["input_groundcover"] = ig[len("s3://test-bucket/"):]
+                return orig_run(**kw)
+
+            seasonalDRCMIbra.run_seasonal_drcm_ibra = _wrapped_aoi
+            sys.argv = [
+                "run_aus_batch_worker.py",
+                "--manifest", aoi_manifest_path,
+                "--shard-index", "0",
+                "--window", "11",
+                "--chunksize", "128",
+                "--no-ibra",
+                "--no-overviews",
+                "--work-dir", os.path.join(tmpdir, "work_aoi"),
+            ]
+            run_aus_batch_worker.main()
+            exp_aoi_key = "DRCM/aoi/lztmre_aus_m202506202508_doda2.tif"
+            assert exp_aoi_key in uploaded_aoi and 1024 <= uploaded_aoi[exp_aoi_key] < 100_000_000
+        finally:
+            sys.argv = orig_argv
+            run_aus_batch_worker._build_s3_client = orig_build_s3
+            run_aus_batch_worker._ensure_local_ref_cache = orig_cache_fn
+            seasonalDRCMIbra.run_seasonal_drcm_ibra = orig_run
+    print(">>> PASS: Batch submission, --save, test_data/ staging, AOI size default & CloudWatch tail verified!")
 
 
 def test_12_serpentine_kernels_and_edge_cases():
@@ -1011,12 +1115,221 @@ def test_12_serpentine_kernels_and_edge_cases():
         e_ib = _oracle_refpixel(ec, eg, ei, window=win, minvalpercent=mv, r_slice=(rs, rp), c_slice=(cs, cp))
         assert np.array_equal(g_ib, e_ib), f"IBRA edge case {label} mismatch"
 
-    print(">>> PASS: Serpentine IBRA (1..255, k=1/k>=2), No-IBRA (strip_h=16384), and all edge cases match oracle 100%!")
+    # 4. H5 overflow & out-of-range ground guard: window=4621 (4621^2*101 > 2^31-1) & ground=120
+    cov_big = np.full((4621, 4621), 50, dtype=np.int8)
+    gnd_big = np.full((4621, 4621), 101, dtype=np.int8)
+    ib_big = np.full((4621, 4621), 17, dtype=np.uint8)
+    res_big_no = refpix_numba.refpixelfilternodata(
+        cov_big, gnd_big, window=4621, minvalpercent=0.1, r_start=2310, r_stop=2312, c_start=2310, c_stop=2312,
+    )
+    res_big_ib = refpix_numba_ibra.refpixelfilter_ibra(
+        cov_big, gnd_big, ib_big, window=4621, minvalpercent=0.1, r_start=2310, r_stop=2312, c_start=2310, c_stop=2312,
+    )
+    assert np.all(res_big_no == 101) and np.all(res_big_ib == 101), "H5 int64 sum regression on window=4621"
+    del cov_big, gnd_big, ib_big
+
+    cov_g = rng.integers(1, 102, size=(41, 41), dtype=np.int16).astype(np.int8)
+    gnd_g = rng.integers(1, 102, size=(41, 41), dtype=np.int16).astype(np.int8)
+    ib_g = np.full((41, 41), 17, dtype=np.uint8)
+    gnd_g[10:30, 10:30] = 120  # invalid > 101 groundcover must be ignored like <= 0
+    assert np.array_equal(
+        refpix_numba.refpixelfilternodata(cov_g, gnd_g, window=15, minvalpercent=0.15),
+        _oracle_refpixel(cov_g, gnd_g, None, window=15, minvalpercent=0.15),
+    )
+    assert np.array_equal(
+        refpix_numba_ibra.refpixelfilter_ibra(cov_g, gnd_g, ib_g, window=15, minvalpercent=0.15),
+        _oracle_refpixel(cov_g, gnd_g, ib_g, window=15, minvalpercent=0.15),
+    )
+
+    print(">>> PASS: Serpentine IBRA (1..255, k=1/k>=2), No-IBRA (strip_h=16384), H5 int64/bounds & edge cases match oracle 100%!")
 
 
-def test_13_remote_vsis3_and_chip_authenticity():
-    print("\n--- Test 13: Remote /vsis3/ Streaming & test_data/ Chip Authenticity Parity ---")
-    with tempfile.TemporaryDirectory(prefix="drcm_test12_") as tmpdir:
+def test_13_stage1_offgrid_and_dixa2_pipelines():
+    print("\n--- Test 13: H1 dixa2 Chunk Parity, H2 Off-Grid Zero-Padding & CRS Checks, H3 Stage-1 Masking ---")
+    with tempfile.TemporaryDirectory(prefix="drcm_test13_") as tmpdir:
+        srs_3577 = osr.SpatialReference()
+        srs_3577.ImportFromEPSG(3577)
+        srs_3577.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        wkt_3577 = srs_3577.ExportToWkt()
+
+        srs_4326 = osr.SpatialReference()
+        srs_4326.ImportFromEPSG(4326)
+        srs_4326.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        wkt_4326 = srs_4326.ExportToWkt()
+
+        # 1. H1: dixa2 GeoTIFF with NoData=255 in chunk 0 and all-(100/255) tail chunk (chunk_size=64)
+        rng = np.random.default_rng(1313)
+        h_d, w_d = 160, 128
+        dix_bare = rng.integers(100, 201, size=(h_d, w_d), dtype=np.uint8)
+        dix_bare[:20, :] = 255
+        dix_bare[80:, :] = 100
+        dix_bare[100:120, :] = 255
+        ref_d = rng.integers(1, 102, size=(h_d, w_d), dtype=np.uint8)
+        ibra_d = np.full((h_d, w_d), 17, dtype=np.uint8)
+        gt_d = (0.0, 25.0, 0.0, 0.0, 0.0, -25.0)
+        dix_in_tif = os.path.join(tmpdir, "synth_m202001_dixa2_vinterim.tif")
+        anon_dix_tif = os.path.join(tmpdir, "anon_synth_input.tif")
+        ref_d_tif = os.path.join(tmpdir, "synth_dixa2_ref_ibra.tif")
+        _write_test_geotiff(dix_in_tif, [dix_bare], gt_d, wkt_3577, nodata=255, predictor=1, block_size=128)
+        _write_test_geotiff(anon_dix_tif, [dix_bare], gt_d, wkt_3577, nodata=255, predictor=1, block_size=128)
+        _write_test_geotiff(ref_d_tif, [ref_d, ibra_d], gt_d, wkt_3577, nodata=0, predictor=1, block_size=128)
+
+        gc_d_exp = convert_to_groundcover(dix_bare, nodata_val=255, encoding="dixa2")
+        oracle_d = _oracle_refpixel(ref_d.view(np.int8), gc_d_exp, ibra_d, window=21, minvalpercent=0.10)
+        exp_d_ref = np.where(oracle_d < 0, 0, 100 + oracle_d).astype(np.uint8)
+        exp_d_dgc = np.where((oracle_d < 0) | (gc_d_exp == 0), 0, 100 + gc_d_exp - oracle_d).astype(np.uint8)
+
+        for label, in_p in (("dixa2_name", dix_in_tif), ("anon_locked", anon_dix_tif)):
+            out_d = os.path.join(tmpdir, f"out_{label}.tif")
+            run_seasonal_drcm_ibra(
+                in_p, ref_d_tif, output_file=out_d, window=21, chunksize=64,
+                minvalpercent=0.10, no_overviews=True,
+            )
+            ds_o = gdal.Open(out_d)
+            assert np.array_equal(ds_o.GetRasterBand(1).ReadAsArray(), exp_d_dgc), f"H1 DGC mismatch ({label})"
+            assert np.array_equal(ds_o.GetRasterBand(2).ReadAsArray(), exp_d_ref), f"H1 Ref mismatch ({label})"
+            ds_o = None
+
+        # 2. H2: Input extends outside smaller reference (all 4 borders), FastLocal + GDAL fallback,
+        # separate --ibra-raster with distinct origin, plus negative resolution & CRS checks
+        in_h, in_w = 100, 100
+        ref_h, ref_w = 60, 60
+        ref_ox, ref_oy = 15, 20  # ref sits at cols [15..75), rows [20..80) inside in_ds
+        in_gt = (100000.0, 25.0, 0.0, -2000000.0, 0.0, -25.0)
+        ref_gt = (in_gt[0] + ref_ox * 25.0, 25.0, 0.0, in_gt[3] - ref_oy * 25.0, 0.0, -25.0)
+        ib_ox, ib_oy, ib_h, ib_w = 10, 10, 80, 75
+        ib_gt = (in_gt[0] + ib_ox * 25.0, 25.0, 0.0, in_gt[3] - ib_oy * 25.0, 0.0, -25.0)
+
+        in_bare_h2 = rng.integers(10, 90, size=(in_h, in_w), dtype=np.uint8)
+        ref_small = rng.integers(10, 101, size=(ref_h, ref_w), dtype=np.uint8)
+        ib_small_combined = rng.choice([17, 58], size=(ref_h, ref_w)).astype(np.uint8)
+        ib_sep = rng.choice([17, 58], size=(ib_h, ib_w)).astype(np.uint8)
+
+        in_h2_tif = os.path.join(tmpdir, "in_h2_dp8a2.tif")
+        ref_h2_2b_tif = os.path.join(tmpdir, "ref_h2_2b.tif")
+        ref_h2_1b_tif = os.path.join(tmpdir, "ref_h2_1b.tif")
+        ib_h2_sep_tif = os.path.join(tmpdir, "ib_h2_sep.tif")
+        _write_test_geotiff(in_h2_tif, [in_bare_h2], in_gt, wkt_3577, nodata=255, predictor=1, block_size=32)
+        _write_test_geotiff(ref_h2_2b_tif, [ref_small, ib_small_combined], ref_gt, wkt_3577, nodata=0, predictor=1, block_size=32)
+        _write_test_geotiff(ref_h2_1b_tif, [ref_small], ref_gt, wkt_3577, nodata=0, predictor=2, block_size=64)
+        _write_test_geotiff(ib_h2_sep_tif, [ib_sep], ib_gt, wkt_3577, nodata=0, predictor=1, block_size=32)
+
+        gc_h2 = convert_to_groundcover(in_bare_h2, nodata_val=255, encoding="dp8a2")
+        pad_ref = np.zeros((in_h, in_w), dtype=np.int8)
+        pad_ref[ref_oy:ref_oy + ref_h, ref_ox:ref_ox + ref_w] = ref_small.view(np.int8)
+        pad_ib_comb = np.zeros((in_h, in_w), dtype=np.uint8)
+        pad_ib_comb[ref_oy:ref_oy + ref_h, ref_ox:ref_ox + ref_w] = ib_small_combined
+        pad_ib_sep = np.zeros((in_h, in_w), dtype=np.uint8)
+        pad_ib_sep[ib_oy:ib_oy + ib_h, ib_ox:ib_ox + ib_w] = ib_sep
+
+        for no_ibra, r_path, ib_path, ib_full in (
+            (True, ref_h2_2b_tif, None, None),
+            (False, ref_h2_2b_tif, None, pad_ib_comb),
+            (False, ref_h2_1b_tif, ib_h2_sep_tif, pad_ib_sep),
+        ):
+            out_h2 = os.path.join(tmpdir, f"h2_{no_ibra}_{ib_path is not None}.tif")
+            run_seasonal_drcm_ibra(
+                in_h2_tif, r_path, ibra_raster=ib_path, output_file=out_h2,
+                window=15, chunksize=40, minvalpercent=0.10, no_ibra=no_ibra, no_overviews=True,
+            )
+            o_h2 = _oracle_refpixel(pad_ref, gc_h2, ib_full, window=15, minvalpercent=0.10)
+            e_ref = np.where(o_h2 < 0, 0, 100 + o_h2).astype(np.uint8)
+            e_dgc = np.where((o_h2 < 0) | (gc_h2 == 0), 0, 100 + gc_h2 - o_h2).astype(np.uint8)
+            ds_h2 = gdal.Open(out_h2)
+            assert np.array_equal(ds_h2.GetRasterBand(1).ReadAsArray(), e_dgc)
+            assert np.array_equal(ds_h2.GetRasterBand(2).ReadAsArray(), e_ref)
+            ds_h2 = None
+
+        bad_res_tif = os.path.join(tmpdir, "bad_res.tif")
+        bad_crs_tif = os.path.join(tmpdir, "bad_crs.tif")
+        _write_test_geotiff(bad_res_tif, [ref_small], (ref_gt[0], 30.0, 0.0, ref_gt[3], 0.0, -30.0), wkt_3577)
+        _write_test_geotiff(bad_crs_tif, [ref_small], ref_gt, wkt_4326)
+        for bad_ref in (bad_res_tif, bad_crs_tif):
+            got_err = False
+            try:
+                run_seasonal_drcm_ibra(in_h2_tif, bad_ref, output_file=os.path.join(tmpdir, "never.tif"), no_ibra=True, no_overviews=True)
+            except ValueError:
+                got_err = True
+            assert got_err, f"Expected ValueError for misaligned/mismatched raster {bad_ref}"
+
+        # 3. H3: maskChangeSteepIbra underflows (202, 254, 255 -> 0), Band 2 on bare=0 hole, OBJECTID > 255 ValueError
+        s1_h, s1_w = 64, 64
+        s1_gt = (0.0, 25.0, 0.0, 0.0, 0.0, -25.0)
+        chg = np.zeros((3, s1_h, s1_w), dtype=np.uint8)
+        chg[0, 5:10, 5:10] = 2  # forest excluded
+        chg[2, 10:15, 5:10] = 1  # cleared excluded
+        trn = np.full((1, s1_h, s1_w), 20, dtype=np.uint8)
+        trn[0, 15:20, 5:10] = 40  # slope >= 40 excluded
+        bare_s1 = np.zeros((7, s1_h, s1_w), dtype=np.uint8)
+        bare_s1[6, :, :] = 150
+        bare_s1[6, 0:4, 0:4] = 255   # invalid border must map to 0, NOT 101
+        bare_s1[6, 0:4, 4:8] = 254   # invalid > 200 must map to 0, NOT 101
+        bare_s1[6, 0:4, 8:12] = 202  # invalid > 200 must map to 0, NOT 101
+        bare_s1[6, 20:40, 20:40] = 0 # bareStats == 0 land hole inside polygon
+
+        chg_tif = os.path.join(tmpdir, "chg.tif")
+        trn_tif = os.path.join(tmpdir, "trn.tif")
+        bare_tif = os.path.join(tmpdir, "bare_dixa2.tif")
+        _write_test_geotiff(chg_tif, [chg[0], chg[1], chg[2]], s1_gt, wkt_3577)
+        _write_test_geotiff(trn_tif, [trn[0]], s1_gt, wkt_3577)
+        _write_test_geotiff(bare_tif, [bare_s1[i] for i in range(7)], s1_gt, wkt_3577, nodata=0)
+
+        fgb_ok = os.path.join(tmpdir, "ibra_ok.fgb")
+        fgb_bad = os.path.join(tmpdir, "ibra_bad.fgb")
+        for fgb_path, oid_val in ((fgb_ok, 17), (fgb_bad, 300)):
+            vdrv = ogr.GetDriverByName("FlatGeobuf")
+            vds = vdrv.CreateDataSource(fgb_path)
+            vlyr = vds.CreateLayer("ibra", srs=srs_3577, geom_type=ogr.wkbPolygon)
+            vlyr.CreateField(ogr.FieldDefn("OBJECTID", ogr.OFTInteger))
+            feat = ogr.Feature(vlyr.GetLayerDefn())
+            feat.SetField("OBJECTID", oid_val)
+            ring = ogr.Geometry(ogr.wkbLinearRing)
+            for px, py in ((0.0, 0.0), (1600.0, 0.0), (1600.0, -1600.0), (0.0, -1600.0), (0.0, 0.0)):
+                ring.AddPoint_2D(px, py)
+            poly = ogr.Geometry(ogr.wkbPolygon)
+            poly.AddGeometry(ring)
+            feat.SetGeometry(poly)
+            vlyr.CreateFeature(feat)
+            vds = None
+
+        s1_out = os.path.join(tmpdir, "s1_out.tif")
+        orig_argv_s1 = sys.argv
+        try:
+            sys.argv = [
+                "maskChangeSteepIbra.py",
+                "--change", chg_tif,
+                "--terrain", trn_tif,
+                "--bare", bare_tif,
+                "--ibra", fgb_ok,
+                "-o", s1_out,
+            ]
+            maskChangeSteepIbra.main()
+        finally:
+            sys.argv = orig_argv_s1
+
+        ds_s1 = gdal.Open(s1_out)
+        s1_b1 = ds_s1.GetRasterBand(1).ReadAsArray()
+        s1_b2 = ds_s1.GetRasterBand(2).ReadAsArray()
+        ds_s1 = None
+        assert np.all(s1_b1[0:4, 0:12] == 0), f"H3 wraparound bug on 202/254/255: {np.unique(s1_b1[0:4, 0:12])}"
+        assert np.all(s1_b1[5:10, 5:10] == 0) and np.all(s1_b1[10:15, 5:10] == 0) and np.all(s1_b1[15:20, 5:10] == 0)
+        assert np.all(s1_b1[25:35, 45:55] == 51)
+        assert np.all(s1_b2[20:40, 20:40] == 17), "H3 Band 2 IBRA must persist on bareStats==0 land holes"
+
+        bad_ds = ogr.Open(fgb_bad)
+        raised_oid = False
+        try:
+            maskChangeSteepIbra.validate_ibra_layer_attribute(bad_ds.GetLayer(0), "OBJECTID")
+        except ValueError:
+            raised_oid = True
+        bad_ds = None
+        assert raised_oid, "Expected ValueError when OBJECTID > 255"
+    print(">>> PASS: H1 dixa2/255 chunks, H2 off-grid/CRS validation & H3 Stage-1 NumPy2/OBJECTID verified!")
+
+
+def test_14_remote_vsis3_and_chip_authenticity():
+    print("\n--- Test 14: Remote /vsis3/ Streaming & test_data/ Chip Authenticity Parity ---")
+    with tempfile.TemporaryDirectory(prefix="drcm_test14_") as tmpdir:
         out_ibra = os.path.join(tmpdir, "s3_ibra.tif")
         out_no_ibra = os.path.join(tmpdir, "s3_no_ibra.tif")
         run_seasonal_drcm_ibra(
@@ -1063,7 +1376,7 @@ def main():
     parser.add_argument(
         "--offline",
         action="store_true",
-        help="Skip remote /vsis3/ streaming test (Test 13); still runs all local + test_data/ real satellite tests (Tests 1-12).",
+        help="Skip remote /vsis3/ streaming test (Test 14); still runs all local + test_data/ real satellite tests (Tests 1-13).",
     )
     args = parser.parse_args()
 
@@ -1080,17 +1393,18 @@ def main():
     test_10_multichunk_and_halo_aoi_parity()
     test_11_batch_worker_and_submission()
     test_12_serpentine_kernels_and_edge_cases()
+    test_13_stage1_offgrid_and_dixa2_pipelines()
 
     if args.offline:
-        print("\n--- Test 13: SKIPPED (--offline specified) ---")
+        print("\n--- Test 14: SKIPPED (--offline specified) ---")
     else:
-        test_13_remote_vsis3_and_chip_authenticity()
+        test_14_remote_vsis3_and_chip_authenticity()
 
     t_total = time.perf_counter() - t0
     ran_label = (
-        "12 OFFLINE TESTS (incl. test_data/ real satellite chips)"
+        "13 OFFLINE TESTS (incl. test_data/ real satellite chips)"
         if args.offline
-        else "ALL 13 CHEAT-PROOF TESTS (incl. test_data/ + /vsis3/ parity)"
+        else "ALL 14 CHEAT-PROOF TESTS (incl. test_data/ + /vsis3/ parity)"
     )
     print("\n========================================================")
     print(f"{ran_label} PASSED in {t_total:.2f}s!")

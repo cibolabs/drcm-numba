@@ -41,6 +41,8 @@ DEFAULT_JOB_DEFINITION = "drcm-aus-multi-season"
 DEFAULT_ECR_IMAGE = "331561773057.dkr.ecr.us-west-2.amazonaws.com/cibobase:baseubuntu_2404_numba"
 DEFAULT_LOG_GROUP = "/aws/batch/cibo-processor-batch-test"
 DEFAULT_LOG_STREAM_PREFIX = "drcm-test"
+DEFAULT_MIN_OUTPUT_BYTES = 100_000_000
+DEFAULT_AOI_MIN_OUTPUT_BYTES = 1_024
 
 WORKER_SCRIPT_FILES = (
     "refpix_numba.py",
@@ -323,14 +325,31 @@ def ensure_job_definition(
     return resolved
 
 
-def stage_scripts_and_manifest(s3, repo_dir, bucket, staging_key_prefix, manifest, local_geojson=None):
-    """Upload pipeline scripts, manifest JSON, and optional local GeoJSON to S3 staging prefix."""
+def stage_scripts_and_manifest(
+    s3,
+    repo_dir,
+    bucket,
+    staging_key_prefix,
+    manifest,
+    local_geojson=None,
+    include_test_data=True,
+    require_test_data=False,
+):
+    """Upload pipeline scripts, optional test_data/ chips, manifest JSON, and local GeoJSON to S3 staging prefix."""
     prefix = staging_key_prefix.strip("/")
     for fname in WORKER_SCRIPT_FILES:
         src = Path(repo_dir) / fname
         if not src.is_file():
             raise FileNotFoundError(f"Required worker script missing: {src}")
         s3.upload_file(str(src), bucket, f"{prefix}/{fname}")
+
+    if include_test_data:
+        test_data_dir = Path(repo_dir) / "test_data"
+        chip_files = sorted(p for p in test_data_dir.iterdir() if p.is_file()) if test_data_dir.is_dir() else []
+        if require_test_data and not chip_files:
+            raise FileNotFoundError(f"Required test_data/ directory missing or empty for --smoke-test: {test_data_dir}")
+        for chip in chip_files:
+            s3.upload_file(str(chip), bucket, f"{prefix}/test_data/{chip.name}")
 
     if local_geojson and not str(local_geojson).startswith(("s3://", "/vsis3/")):
         gj_path = Path(local_geojson)
@@ -350,14 +369,16 @@ def stage_scripts_and_manifest(s3, repo_dir, bucket, staging_key_prefix, manifes
     return staging_uri
 
 
-def _tail_cloudwatch(logs_cli, log_group, log_stream, next_token=None):
+def _tail_cloudwatch(logs_cli, log_group, log_stream, next_token=None, start_from_head=None, limit=None):
     kw = {
         "logGroupName": log_group,
         "logStreamName": log_stream,
-        "startFromHead": next_token is None,
+        "startFromHead": (next_token is None) if start_from_head is None else bool(start_from_head),
     }
     if next_token is not None:
         kw["nextToken"] = next_token
+    if limit is not None:
+        kw["limit"] = int(limit)
     try:
         resp = logs_cli.get_log_events(**kw)
     except Exception as exc:
@@ -466,7 +487,7 @@ def watch_batch_job(
                         fls = _extract_log_stream(fj)
                         print(f"CHILD_FAILED {fj['jobId']} reason={fj.get('statusReason')} logStream={fls}", flush=True)
                         if fls:
-                            _, fmsgs = _tail_cloudwatch(logs_cli, log_group, fls, None)
+                            _, fmsgs = _tail_cloudwatch(logs_cli, log_group, fls, None, start_from_head=False, limit=50)
                             for msg in fmsgs[-25:]:
                                 print(f"  ! {msg}", flush=True)
             except Exception as exc:
@@ -563,7 +584,12 @@ def parse_args():
     p.add_argument("--no-overviews", action="store_true", default=False, help="Skip internal GDAL overview pyramids")
     p.add_argument("--geojson", default=None, help="Optional AOI GeoJSON path or s3:// URI")
     p.add_argument("--bbox", nargs=4, type=float, default=None, metavar=("MINX", "MINY", "MAXX", "MAXY"))
-    p.add_argument("--min-output-bytes", type=int, default=100_000_000, help="Minimum valid output size in bytes (default: 100000000)")
+    p.add_argument(
+        "--min-output-bytes",
+        type=int,
+        default=None,
+        help="Minimum valid output size in bytes (default: 100000000 full-res, 1024 when --bbox/--geojson is active)",
+    )
 
     p.add_argument("--job-name", default=None, help="AWS Batch job name (default: drcm-aus-<run_tag>)")
     p.add_argument("--job-queue", default=DEFAULT_JOB_QUEUE, help=f"AWS Batch job queue (default: {DEFAULT_JOB_QUEUE})")
@@ -636,6 +662,20 @@ def main():
                     s3, repo_dir, args.bucket, f"{args.staging_prefix.strip('/')}/{run_tag}", manifest, args.geojson
                 )
 
+        eff_retry_min_bytes = (
+            args.min_output_bytes
+            if args.min_output_bytes is not None
+            else (
+                DEFAULT_AOI_MIN_OUTPUT_BYTES
+                if (
+                    args.bbox is not None
+                    or args.geojson is not None
+                    or manifest.get("bbox") is not None
+                    or manifest.get("geojson") is not None
+                )
+                else DEFAULT_MIN_OUTPUT_BYTES
+            )
+        )
         cmd = build_worker_command(
             staging_uri,
             work_subdir=run_tag,
@@ -644,7 +684,7 @@ def main():
             minvalpercent=args.minvalpercent,
             no_ibra=args.no_ibra,
             no_overviews=args.no_overviews,
-            min_output_bytes=args.min_output_bytes,
+            min_output_bytes=eff_retry_min_bytes,
             explicit_shard_index=args.retry_shard,
         )
         if args.dry_run:
@@ -693,9 +733,19 @@ def main():
             s3, args.bucket, args.gc_prefix, args.pattern, start_ym=args.start_ym, end_ym=args.end_ym
         )
 
+    eff_min_output_bytes = (
+        args.min_output_bytes
+        if args.min_output_bytes is not None
+        else (
+            DEFAULT_AOI_MIN_OUTPUT_BYTES
+            if (args.bbox is not None or args.geojson is not None)
+            else DEFAULT_MIN_OUTPUT_BYTES
+        )
+    )
+
     if args.skip_existing and items:
         items, skipped = filter_existing_outputs(
-            s3, items, args.bucket, args.output_prefix, args.no_ibra, args.min_output_bytes
+            s3, items, args.bucket, args.output_prefix, args.no_ibra, eff_min_output_bytes
         )
         print(f"Pre-filtered existing outputs: {skipped} skipped, {len(items)} remaining", flush=True)
 
@@ -735,7 +785,7 @@ def main():
         minvalpercent=args.minvalpercent,
         no_ibra=args.no_ibra,
         no_overviews=args.no_overviews,
-        min_output_bytes=args.min_output_bytes,
+        min_output_bytes=eff_min_output_bytes,
         explicit_shard_index=explicit_idx,
     )
 
@@ -770,7 +820,16 @@ def main():
         job_role_arn=args.job_role_arn,
         exec_role_arn=args.exec_role_arn,
     )
-    stage_scripts_and_manifest(s3, repo_dir, args.bucket, staging_key_prefix, manifest, args.geojson)
+    stage_scripts_and_manifest(
+        s3,
+        repo_dir,
+        args.bucket,
+        staging_key_prefix,
+        manifest,
+        args.geojson,
+        include_test_data=True,
+        require_test_data=args.smoke_test,
+    )
 
     # 3. Optional pre-flight smoke test before submitting main array
     if args.smoke_test:
@@ -840,7 +899,7 @@ def main():
             args.output_prefix,
             [k for k, _ in items],
             args.no_ibra,
-            args.min_output_bytes,
+            eff_min_output_bytes,
         )
         sys.exit(0 if ok else 5)
 

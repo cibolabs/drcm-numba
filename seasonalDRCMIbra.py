@@ -15,6 +15,7 @@ import http.client
 import math
 import os
 import random
+import re
 import resource
 import tempfile
 import time
@@ -148,7 +149,27 @@ def parse_args():
         action="store_true",
         help="Upload local output to s3://cibo-dat-oregon/DRCM/ and delete the local file on completion"
     )
+    parser.add_argument(
+        "--bare-encoding",
+        choices=("auto", "dp8a2", "dixa2"),
+        default="auto",
+        help="Input bare ground scaling stage (default: auto, inferring dp8 vs dix from filename)"
+    )
     return parser.parse_args()
+
+
+_STAGE_DIX_RE = re.compile(r"(?:^|[_\-.])dix", re.IGNORECASE)
+_STAGE_DP8_RE = re.compile(r"(?:^|[_\-.])dp8", re.IGNORECASE)
+
+
+def infer_bare_encoding_from_filename(input_path):
+    """Infer bare ground stage ('dixa2' vs 'dp8a2') from constant pipeline stage tokens in basename."""
+    base = os.path.basename(str(input_path or ""))
+    if _STAGE_DIX_RE.search(base):
+        return "dixa2"
+    if _STAGE_DP8_RE.search(base):
+        return "dp8a2"
+    return None
 
 
 def derive_output_name(input_path, no_ibra=False):
@@ -166,21 +187,48 @@ def derive_output_name(input_path, no_ibra=False):
 
 
 @njit(parallel=True)
-def _max_u8_2d(arr):
+def _scan_valid_minmax_u8_2d(arr, nodata_i16):
+    """Scan uint8 array for min/max candidate bare values in [0, 200] excluding nodata."""
     h, w = arr.shape
+    row_has = np.zeros(h, dtype=np.uint8)
+    row_min = np.full(h, 255, dtype=np.uint8)
     row_max = np.zeros(h, dtype=np.uint8)
     for r in prange(h):
-        m = np.uint8(0)
+        has_v = np.uint8(0)
+        lo = np.uint8(255)
+        hi = np.uint8(0)
         for c in range(w):
             v = arr[r, c]
-            if v > m:
-                m = v
-        row_max[r] = m
-    m = np.uint8(0)
+            if v <= 200 and np.int16(v) != nodata_i16:
+                if has_v == 0:
+                    has_v = np.uint8(1)
+                    lo = v
+                    hi = v
+                else:
+                    if v < lo:
+                        lo = v
+                    if v > hi:
+                        hi = v
+        row_has[r] = has_v
+        row_min[r] = lo
+        row_max[r] = hi
+    has_any = False
+    lo = 255
+    hi = 0
     for r in range(h):
-        if row_max[r] > m:
-            m = row_max[r]
-    return int(m)
+        if row_has[r] != 0:
+            v_lo = int(row_min[r])
+            v_hi = int(row_max[r])
+            if not has_any:
+                has_any = True
+                lo = v_lo
+                hi = v_hi
+            else:
+                if v_lo < lo:
+                    lo = v_lo
+                if v_hi > hi:
+                    hi = v_hi
+    return has_any, lo, hi
 
 
 @njit(parallel=True)
@@ -201,53 +249,104 @@ def _apply_lut_u8_inplace(arr_u8, lut_u8):
 
 @njit(parallel=True)
 def _encode_outputs_2d(chunk_gc, chunk_ref):
-    """Compute uint8 DGC and scaled reference cover without int64 intermediate arrays."""
+    """Compute uint8 DGC and scaled reference cover without int64 intermediate arrays or wraparound."""
     h, w = chunk_ref.shape
     dgc_data = np.empty((h, w), dtype=np.uint8)
     ref_data_scaled = np.empty((h, w), dtype=np.uint8)
     for r in prange(h):
         for c in range(w):
             rv = chunk_ref[r, c]
-            if rv < 0:
+            if rv < 0 or rv > 101:
                 ref_data_scaled[r, c] = 0
                 dgc_data[r, c] = 0
             else:
                 ref_data_scaled[r, c] = np.uint8(100 + rv)
                 gv = chunk_gc[r, c]
-                if gv == 0:
+                if gv <= 0 or gv > 101:
                     dgc_data[r, c] = 0
                 else:
-                    dgc_data[r, c] = np.uint8(100 + gv - rv)
+                    diff = 100 + int(gv) - int(rv)
+                    if diff < 0:
+                        diff = 0
+                    elif diff > 255:
+                        diff = 255
+                    dgc_data[r, c] = np.uint8(diff)
     return dgc_data, ref_data_scaled
 
 
-def convert_to_groundcover(bare_data, nodata_val=255, inplace=False):
+def _infer_encoding_from_array(bare_data, nodata_val=255):
+    """
+    Infer bare ground encoding ('dp8a2' vs 'dixa2') and whether evidence is decisive
+    from valid values in [0, 200] excluding nodata.
+    """
+    nd_int = None
+    if nodata_val is not None:
+        try:
+            cand = int(nodata_val)
+            if cand == nodata_val:
+                nd_int = cand
+        except (TypeError, ValueError, OverflowError):
+            pass
+
+    if bare_data.dtype == np.uint8 and bare_data.ndim == 2:
+        nd_i16 = np.int16(nd_int) if (nd_int is not None and 0 <= nd_int <= 255) else np.int16(-1)
+        has_valid, min_valid, max_valid = _scan_valid_minmax_u8_2d(bare_data, nd_i16)
+    else:
+        valid_cand = (bare_data >= 0) & (bare_data <= 200)
+        if nodata_val is not None:
+            valid_cand &= bare_data != nodata_val
+        has_valid = bool(np.any(valid_cand))
+        if has_valid:
+            vals = bare_data[valid_cand]
+            min_valid = int(np.min(vals))
+            max_valid = int(np.max(vals))
+        else:
+            min_valid = 255
+            max_valid = 0
+
+    if has_valid and max_valid > 100:
+        return "dixa2", True
+    if has_valid and min_valid < 100:
+        decisive = (min_valid > 0) or (nd_int != 0)
+        return "dp8a2", decisive
+    return ("dixa2" if nd_int == 0 else "dp8a2"), False
+
+
+def convert_to_groundcover(bare_data, nodata_val=255, inplace=False, encoding=None):
     """
     Convert raw bare ground array to persistent groundcover + 1 (values 1..101, 0 is nodata).
 
-    Auto-detects and supports both remote sensing standards:
-    - Modern DEA (dp8a2): Bare stored as 0..100% with 255 NoData.
-      Groundcover = 100 - bare% -> mapped to 101 - bare (1..101 range).
-    - Legacy JRSRP/RSC (dixa2): Bare stored with +100 offset (100 = 0% bare, 200 = 100% bare).
-      Groundcover mapped to 201 - bare (1..101 range).
+    Supports both remote sensing standards:
+    - Modern DEA (dp8a2): Bare stored as 0..100% with 255 NoData -> 101 - bare (1..101).
+    - Legacy JRSRP/RSC (dixa2): Bare stored with +100 offset (100..200) -> 201 - bare (1..101).
+    If encoding ('dp8a2' or 'dixa2') is specified, applies the LUT in one pass without scanning.
     """
     if bare_data.size == 0:
         return np.empty(bare_data.shape, dtype=np.int8)
 
+    if encoding is None:
+        encoding, _ = _infer_encoding_from_array(bare_data, nodata_val)
+    elif encoding not in ("dp8a2", "dixa2"):
+        raise ValueError(f"Unsupported bare ground encoding: {encoding}")
+
+    is_dixa2 = encoding == "dixa2"
+    nd_int = None
+    if nodata_val is not None:
+        try:
+            cand = int(nodata_val)
+            if cand == nodata_val:
+                nd_int = cand
+        except (TypeError, ValueError, OverflowError):
+            pass
+
     if bare_data.dtype == np.uint8 and bare_data.ndim == 2:
-        max_val = _max_u8_2d(bare_data)
         lut = np.zeros(256, dtype=np.int8)
-        if max_val > 100 and max_val != 255:
+        if is_dixa2:
             lut[100:201] = np.arange(101, 0, -1, dtype=np.int8)
         else:
             lut[0:101] = np.arange(101, 0, -1, dtype=np.int8)
-        if nodata_val is not None:
-            try:
-                nd = int(nodata_val)
-                if 0 <= nd <= 255 and nd == nodata_val:
-                    lut[nd] = 0
-            except (TypeError, ValueError):
-                pass
+        if nd_int is not None and 0 <= nd_int <= 255:
+            lut[nd_int] = 0
         if inplace and bare_data.flags.writeable:
             # Output range 0..101 is bit-identical across uint8 and int8 views.
             _apply_lut_u8_inplace(bare_data, lut.view(np.uint8))
@@ -256,13 +355,15 @@ def convert_to_groundcover(bare_data, nodata_val=255, inplace=False):
         _apply_lut_u8_2d(bare_data, lut, out)
         return out
 
-    max_val = np.max(bare_data)
-    if max_val > 100 and max_val != 255:
-        gc = np.where((bare_data >= 100) & (bare_data <= 200) & (bare_data != nodata_val),
-                      201 - bare_data, 0)
+    if is_dixa2:
+        valid = (bare_data >= 100) & (bare_data <= 200)
+        top_off = 201
     else:
-        gc = np.where((bare_data <= 100) & (bare_data != nodata_val),
-                      101 - bare_data, 0)
+        valid = (bare_data >= 0) & (bare_data <= 100)
+        top_off = 101
+    if nodata_val is not None:
+        valid &= bare_data != nodata_val
+    gc = np.where(valid, top_off - bare_data.astype(np.int32), 0)
     return np.clip(gc, 0, 101).astype(np.int8)
 
 
@@ -557,6 +658,28 @@ class _FastS3TiledBandReader:
         return out
 
 
+def _read_clipped_band_window(read_fn, band_w, band_h, win, fill=0):
+    """
+    Read a spatial window from a band, using zero-copy direct read when completely
+    in bounds and zero-padding any portion extending outside [0, band_w) x [0, band_h).
+    """
+    xoff, yoff, xsize, ysize = map(int, win)
+    if xsize <= 0 or ysize <= 0:
+        return np.empty((max(0, ysize), max(0, xsize)), dtype=np.uint8)
+    if xoff >= 0 and yoff >= 0 and (xoff + xsize) <= band_w and (yoff + ysize) <= band_h:
+        return read_fn((xoff, yoff, xsize, ysize))
+
+    out = np.full((ysize, xsize), fill, dtype=np.uint8)
+    ix0 = max(0, xoff)
+    iy0 = max(0, yoff)
+    ix1 = min(band_w, xoff + xsize)
+    iy1 = min(band_h, yoff + ysize)
+    if ix1 > ix0 and iy1 > iy0:
+        sub = read_fn((ix0, iy0, ix1 - ix0, iy1 - iy0))
+        out[(iy0 - yoff):(iy1 - yoff), (ix0 - xoff):(ix1 - xoff)] = sub
+    return out
+
+
 class _SequentialBandReader:
     """
     Hybrid S3/GDAL raster reader preferring parallel coalesced DEFLATE tile reading
@@ -592,12 +715,17 @@ class _SequentialBandReader:
         self.in_band = self.in_ds.GetRasterBand(1)
         self.ref_ds = opened[1]
         self.ref_band = self.ref_ds.GetRasterBand(1)
+        self.ref_w, self.ref_h = self.ref_ds.RasterXSize, self.ref_ds.RasterYSize
         if ibra_band_idx is not None:
             if ibra_path:
                 self.ibra_ds = opened[2]
                 self.ibra_band = self.ibra_ds.GetRasterBand(ibra_band_idx)
+                self.ibra_w, self.ibra_h = self.ibra_ds.RasterXSize, self.ibra_ds.RasterYSize
             else:
                 self.ibra_band = self.ref_ds.GetRasterBand(ibra_band_idx)
+                self.ibra_w, self.ibra_h = self.ref_w, self.ref_h
+        else:
+            self.ibra_w, self.ibra_h = self.ref_w, self.ref_h
 
         s3_client = self._maybe_build_s3_client(in_path, ref_path, ibra_path)
         has_local = any(
@@ -710,34 +838,40 @@ class _SequentialBandReader:
         return _read_gdal_band_with_retry(self.in_band, in_win)
 
     def _read_ref_one(self, ref_win, pool):
-        if self.ref_fast is not None:
-            arr = self.ref_fast.read_window(ref_win, pool)
-        else:
-            arr = _read_gdal_band_with_retry(self.ref_band, ref_win)
+        def _raw_ref(w):
+            if self.ref_fast is not None:
+                return self.ref_fast.read_window(w, pool)
+            return _read_gdal_band_with_retry(self.ref_band, w)
+
+        arr = _read_clipped_band_window(_raw_ref, self.ref_w, self.ref_h, ref_win, fill=0)
         return arr.view(np.int8) if arr.dtype == np.uint8 else arr.astype(np.int8)
 
-    def _read_ibra_one(self, ref_win, pool):
-        if self.ibra_fast is not None:
-            ib_arr = self.ibra_fast.read_window(ref_win, pool)
-        else:
-            ib_arr = _read_gdal_band_with_retry(self.ibra_band, ref_win)
+    def _read_ibra_one(self, ibra_win, pool):
+        def _raw_ib(w):
+            if self.ibra_fast is not None:
+                return self.ibra_fast.read_window(w, pool)
+            return _read_gdal_band_with_retry(self.ibra_band, w)
+
+        ib_arr = _read_clipped_band_window(_raw_ib, self.ibra_w, self.ibra_h, ibra_win, fill=0)
         return ib_arr if ib_arr.dtype == np.uint8 else ib_arr.astype(np.uint8)
 
     def read_in_window(self, in_win):
         """Read raw groundcover/bare input window."""
         return self._read_in_one(in_win, self.io_pool)
 
-    def read_ref_windows(self, ref_win, need_ibra=False):
+    def read_ref_windows(self, ref_win, need_ibra=False, ibra_win=None):
         """Read reference percentile (and optional IBRA) window."""
         perc = self._read_ref_one(ref_win, self.io_pool)
-        ibra = self._read_ibra_one(ref_win, self.io_pool) if need_ibra else None
+        eff_ib_win = ref_win if ibra_win is None else ibra_win
+        ibra = self._read_ibra_one(eff_ib_win, self.io_pool) if need_ibra else None
         return perc, ibra
 
-    def read_all_windows(self, in_win, ref_win, need_ibra=False):
+    def read_all_windows(self, in_win, ref_win, need_ibra=False, ibra_win=None):
         """Concurrently read input, reference, and optional IBRA windows when safe."""
+        eff_ib_win = ref_win if ibra_win is None else ibra_win
         if self.coord_pool is None:
             bare = self.read_in_window(in_win)
-            perc, ibra = self.read_ref_windows(ref_win, need_ibra=need_ibra)
+            perc, ibra = self.read_ref_windows(ref_win, need_ibra=need_ibra, ibra_win=eff_ib_win)
             return bare, perc, ibra
 
         f_in = self.coord_pool.submit(self._read_in_one, in_win, self.band_pools.get("in", self.io_pool))
@@ -750,7 +884,7 @@ class _SequentialBandReader:
         if can_split_ref_ibra:
             f_ref = self.coord_pool.submit(self._read_ref_one, ref_win, self.band_pools.get("ref", self.io_pool))
             f_ib = (
-                self.coord_pool.submit(self._read_ibra_one, ref_win, self.band_pools.get("ibra", self.io_pool))
+                self.coord_pool.submit(self._read_ibra_one, eff_ib_win, self.band_pools.get("ibra", self.io_pool))
                 if need_ibra else None
             )
             bare = f_in.result()
@@ -758,7 +892,7 @@ class _SequentialBandReader:
             ibra = f_ib.result() if f_ib is not None else None
             return bare, perc, ibra
 
-        f_pair = self.coord_pool.submit(self.read_ref_windows, ref_win, True)
+        f_pair = self.coord_pool.submit(self.read_ref_windows, ref_win, True, eff_ib_win)
         bare = f_in.result()
         perc, ibra = f_pair.result()
         return bare, perc, ibra
@@ -847,6 +981,44 @@ def _resolve_bbox_bounds(bbox=None, geojson=None, target_proj_wkt=None):
     return minx, miny, maxx, maxy
 
 
+def _validate_aligned_grid(in_gt, in_proj, target_gt, target_proj, target_label):
+    """
+    Validate axis-aligned grid compatibility, pixel resolution, CRS identity, and
+    integer pixel offset (dx, dy) between input_groundcover and reference/IBRA raster.
+    """
+    if in_gt[2] != 0 or in_gt[4] != 0 or in_gt[1] <= 0 or in_gt[5] >= 0:
+        raise ValueError(f"Expected north-up axis-aligned GeoTransform for input raster, got {in_gt}")
+    if target_gt[2] != 0 or target_gt[4] != 0 or target_gt[1] <= 0 or target_gt[5] >= 0:
+        raise ValueError(f"Expected north-up axis-aligned GeoTransform for {target_label}, got {target_gt}")
+    if not (
+        math.isclose(in_gt[1], target_gt[1], rel_tol=1e-6, abs_tol=1e-9)
+        and math.isclose(in_gt[5], target_gt[5], rel_tol=1e-6, abs_tol=1e-9)
+    ):
+        raise ValueError(
+            f"Pixel size mismatch between input ({in_gt[1]}, {in_gt[5]}) and {target_label} ({target_gt[1]}, {target_gt[5]})"
+        )
+
+    if in_proj and target_proj:
+        s_in = osr.SpatialReference()
+        s_in.ImportFromWkt(in_proj)
+        s_in.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        s_tgt = osr.SpatialReference()
+        s_tgt.ImportFromWkt(target_proj)
+        s_tgt.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        if not s_in.IsSame(s_tgt):
+            raise ValueError(f"Projection CRS mismatch between input raster and {target_label}.")
+
+    dx_f = (in_gt[0] - target_gt[0]) / target_gt[1]
+    dy_f = (in_gt[3] - target_gt[3]) / target_gt[5]
+    dx = int(round(dx_f))
+    dy = int(round(dy_f))
+    if abs(dx_f - dx) > 1e-3 or abs(dy_f - dy) > 1e-3:
+        raise ValueError(
+            f"Sub-pixel grid misalignment between input and {target_label}: dx={dx_f:.6f}, dy={dy_f:.6f}"
+        )
+    return dx, dy
+
+
 def _chunk_bounds(chunk, chunksize, full_height, y_origin_off, in_h, ref_h, in_to_ref_dy, halfwindow, pad_halo):
     """Compute exact source/reference windows and output slices for a chunk."""
     datastartline = chunk * chunksize
@@ -857,9 +1029,7 @@ def _chunk_bounds(chunk, chunksize, full_height, y_origin_off, in_h, ref_h, in_t
     else:
         in_read_y0 = y_origin_off + max(0, datastartline - halfwindow)
         in_read_y1 = y_origin_off + min(full_height, datastopline + halfwindow)
-    win_ysize = in_read_y1 - in_read_y0
-    ref_start_y = in_to_ref_dy + in_read_y0
-    ref_read_y = max(0, min(ref_start_y, ref_h - win_ysize))
+    ref_read_y = in_to_ref_dy + in_read_y0
     y_slice_start = (y_origin_off + datastartline) - in_read_y0
     y_slice_stop = (y_origin_off + datastopline) - in_read_y0
     return datastartline, datastopline, in_read_y0, in_read_y1, ref_read_y, y_slice_start, y_slice_stop
@@ -902,7 +1072,8 @@ def run_seasonal_drcm_ibra(
     overview_levels=(4, 8, 16, 32),
     no_overviews=False,
     no_ibra=False,
-    save=False
+    save=False,
+    bare_encoding="auto",
 ):
     eff_cpus = threads if threads is not None else _get_effective_cpus()
     if threads is not None or os.environ.get("NUMBA_NUM_THREADS") is None:
@@ -944,9 +1115,12 @@ def run_seasonal_drcm_ibra(
     print(f"Opening reference stats file: {percentile_file}", flush=True)
     ref_ds = gdal.Open(ref_gdal_path, gdal.GA_ReadOnly)
     ref_gt = ref_ds.GetGeoTransform()
+    ref_proj = ref_ds.GetProjection()
     ref_w, ref_h = ref_ds.RasterXSize, ref_ds.RasterYSize
 
     ibra_band_idx = None
+    ibra_gt = ref_gt
+    ibra_proj = ref_proj
     if not no_ibra:
         if ref_ds.RasterCount >= 2:
             ibra_band_idx = 2
@@ -954,9 +1128,16 @@ def run_seasonal_drcm_ibra(
         elif ibra_gdal_path:
             print(f"Opening separate IBRA raster: {ibra_raster}", flush=True)
             ibra_ds_tmp = gdal.Open(ibra_gdal_path, gdal.GA_ReadOnly)
+            if ibra_ds_tmp.RasterCount < 1:
+                ibra_ds_tmp = None
+                in_band = in_ds = ref_ds = None
+                raise ValueError(f"IBRA raster has no bands: {ibra_raster}")
+            ibra_gt = ibra_ds_tmp.GetGeoTransform()
+            ibra_proj = ibra_ds_tmp.GetProjection()
             ibra_band_idx = 1
             ibra_ds_tmp = None
         else:
+            in_band = in_ds = ref_ds = None
             raise ValueError(
                 f"{percentile_file} has only 1 band. Please specify --ibra-raster, provide a 2-band masked stats+IBRA raster, or use --no-ibra."
             )
@@ -967,6 +1148,8 @@ def run_seasonal_drcm_ibra(
 
     if test_chip:
         x_origin_off, y_origin_off, full_width, full_height = test_chip
+        if x_origin_off < 0 or y_origin_off < 0 or full_width <= 0 or full_height <= 0 or (x_origin_off + full_width) > in_w or (y_origin_off + full_height) > in_h:
+            raise ValueError(f"--test-chip {test_chip} out of bounds for input raster {in_w}x{in_h}")
         pad_halo = False
         print(f"Running on test chip: xoff={x_origin_off}, yoff={y_origin_off}, w={full_width}, h={full_height}", flush=True)
     elif bbox is not None or geojson is not None:
@@ -1002,8 +1185,22 @@ def run_seasonal_drcm_ibra(
         in_gt[5],
     )
 
-    in_to_ref_dx = int(round((in_gt[0] - ref_gt[0]) / ref_gt[1]))
-    in_to_ref_dy = int(round((in_gt[3] - ref_gt[3]) / ref_gt[5]))
+    in_to_ref_dx, in_to_ref_dy = _validate_aligned_grid(in_gt, in_proj, ref_gt, ref_proj, "reference raster")
+    if not no_ibra and ibra_gdal_path is not None:
+        in_to_ibra_dx, in_to_ibra_dy = _validate_aligned_grid(in_gt, in_proj, ibra_gt, ibra_proj, "IBRA raster")
+    else:
+        in_to_ibra_dx, in_to_ibra_dy = in_to_ref_dx, in_to_ref_dy
+
+    if bare_encoding in ("dp8a2", "dixa2"):
+        locked_encoding = bare_encoding
+        print(f"Bare ground encoding: {locked_encoding} (explicit)", flush=True)
+    elif bare_encoding == "auto":
+        locked_encoding = infer_bare_encoding_from_filename(input_groundcover)
+        if locked_encoding is not None:
+            print(f"Bare ground encoding: {locked_encoding} (from filename stage)", flush=True)
+    else:
+        raise ValueError(f"Unsupported bare_encoding: {bare_encoding}")
+
     print(
         f"Spatial alignment offset in reference grid: col={in_to_ref_dx + x_origin_off}, "
         f"row={in_to_ref_dy + y_origin_off}",
@@ -1032,8 +1229,8 @@ def run_seasonal_drcm_ibra(
     x_slice_start = x_origin_off - in_read_x0
     x_slice_stop = x_slice_start + full_width
 
-    ref_start_x = in_to_ref_dx + in_read_x0
-    ref_read_x = max(0, min(ref_start_x, ref_w - win_xsize))
+    ref_read_x = in_to_ref_dx + in_read_x0
+    ibra_read_x = in_to_ibra_dx + in_read_x0
 
     io_workers = min(32, max(8, eff_cpus // 2 if eff_cpus >= 16 else eff_cpus))
     reader = _SequentialBandReader(
@@ -1091,10 +1288,12 @@ def run_seasonal_drcm_ibra(
         t0 = time.perf_counter()
         if read_h <= 0:
             return None, None, None, 0.0
+        ibra_win = (ibra_read_x, in_to_ibra_dy + read_y_in, win_xsize, read_h) if not no_ibra else None
         bare, perc_part, ibra_part = reader.read_all_windows(
             (in_read_x0, read_y_in, win_xsize, read_h),
             (ref_read_x, read_y_ref, win_xsize, read_h),
             need_ibra=(not no_ibra),
+            ibra_win=ibra_win,
         )
         return bare, perc_part, ibra_part, (time.perf_counter() - t0)
 
@@ -1152,7 +1351,17 @@ def run_seasonal_drcm_ibra(
             t_io0 = time.perf_counter()
             bare_tail, perc_tail, ibra_tail, io_work_s = next_future.result()
             total_io_work_s += io_work_s
-            gc_tail = convert_to_groundcover(bare_tail, nodata_in, inplace=True) if bare_tail is not None else None
+            if bare_tail is not None:
+                if locked_encoding is None:
+                    # Only reached for non-standard filenames lacking dp8/dix stage tokens.
+                    chunk_enc, is_decisive = _infer_encoding_from_array(bare_tail, nodata_in)
+                    if is_decisive:
+                        locked_encoding = chunk_enc
+                else:
+                    chunk_enc = locked_encoding
+                gc_tail = convert_to_groundcover(bare_tail, nodata_in, inplace=True, encoding=chunk_enc)
+            else:
+                gc_tail = None
             del bare_tail
 
             if cur_plan["reuse_ok"]:
@@ -1160,28 +1369,40 @@ def run_seasonal_drcm_ibra(
                 prev_s = in_read_y0 - prev_state["y0"]
                 prev_e = prev_s + ov_rows
 
+                # Pop prev_state arrays incrementally so old chunk buffers are freed immediately.
                 groundcover_data = np.empty((win_ysize, win_xsize), dtype=np.int8)
+                prev_gc = prev_state.pop("gc")
+                groundcover_data[:ov_rows] = prev_gc[prev_s:prev_e]
+                del prev_gc
+                if gc_tail is not None:
+                    groundcover_data[ov_rows:] = gc_tail
+                gc_tail = None
+
                 percentile_data = np.empty((win_ysize, win_xsize), dtype=np.int8)
-                groundcover_data[:ov_rows] = prev_state["gc"][prev_s:prev_e]
-                percentile_data[:ov_rows] = prev_state["perc"][prev_s:prev_e]
+                prev_perc = prev_state.pop("perc")
+                percentile_data[:ov_rows] = prev_perc[prev_s:prev_e]
+                del prev_perc
+                if perc_tail is not None:
+                    percentile_data[ov_rows:] = perc_tail
+                perc_tail = None
+
                 if not no_ibra:
                     ibra_data = np.empty((win_ysize, win_xsize), dtype=np.uint8)
-                    ibra_data[:ov_rows] = prev_state["ibra"][prev_s:prev_e]
+                    prev_ib = prev_state.pop("ibra")
+                    ibra_data[:ov_rows] = prev_ib[prev_s:prev_e]
+                    del prev_ib
+                    if ibra_tail is not None:
+                        ibra_data[ov_rows:] = ibra_tail
+                    ibra_tail = None
                 else:
                     ibra_data = None
                 prev_state = None
-
-                if gc_tail is not None:
-                    groundcover_data[ov_rows:] = gc_tail
-                    percentile_data[ov_rows:] = perc_tail
-                    if not no_ibra:
-                        ibra_data[ov_rows:] = ibra_tail
             else:
                 prev_state = None
                 groundcover_data = gc_tail
                 percentile_data = perc_tail
                 ibra_data = ibra_tail
-            del gc_tail, perc_tail, ibra_tail
+                gc_tail = perc_tail = ibra_tail = None
             t_io1 = time.perf_counter()
             io_wait_s = t_io1 - t_io0
             total_io_wait_s += io_wait_s
@@ -1342,7 +1563,8 @@ def main():
         overview_levels=args.overviews,
         no_overviews=args.no_overviews,
         no_ibra=args.no_ibra,
-        save=args.save
+        save=args.save,
+        bare_encoding=args.bare_encoding,
     )
 
 
