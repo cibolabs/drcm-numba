@@ -222,6 +222,9 @@ __marimo__/
 # Geospatial binary & intermediate files
 *.tif
 *.tiff
+!test_data/
+!test_data/*.tif
+!test_data/*.geojson
 *.vrt
 *.fgb
 *.geojson

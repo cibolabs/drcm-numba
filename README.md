@@ -219,27 +219,33 @@ Cibo Labs upgraded the pipeline across four optimization generations while maint
 
 ---
 
-## 6. Verification and Test Suite (`test_ibra_drcm.py`)
+## 6. Verification and Test Suite (`test_ibra_drcm.py`) & Portable Test Data (`test_data/`)
 
-The test suite provides **11 automated end-to-end verification tests** supporting both full online `/vsis3/` testing (`python test_ibra_drcm.py`) and credential-free local/CI runs (`python test_ibra_drcm.py --offline`):
+The repository includes ~`495 KiB` of real Australian Albers (`EPSG:3577`) Landsat test chips in `test_data/` so contributors outside Cibo Labs can run full end-to-end satellite pipeline tests without AWS credentials:
+- `test_data/lztmre_aus_m198912202012_dixa2_change_slope_ibra.tif` (`520 × 520`, `156 KiB`) — 2-band reference stats + IBRA 7.0 regions (`17` Darling Riverine Plains & `58` Cobar Peneplain)
+- `test_data/lztmre_aus_m202606202608_dp8a2_vinterim.tif` (`440 × 440`, `338 KiB`) — seasonal bare cover chip nested at offset `(col=40, row=40)` inside the reference grid
+- `test_data/aoi_nsw_ibra_boundary.geojson` (`793 B`) — `EPSG:4326` polygon spanning the IBRA 17 / 58 boundary for offline halo-padded AOI verification
+
+The test suite provides **12 cheat-proof verification tests** supporting both full online `/vsis3/` testing (`python test_ibra_drcm.py`) and credential-free local/CI runs (`python test_ibra_drcm.py --offline`):
 
 | Test | Scope | Verified Properties |
 | :--- | :--- | :--- |
 | **Test 1** | Utility & URI Helpers | `format_time`, `derive_output_name` (`dp8a2`/`dixa2`), `_parse_s3_uri`, `_parse_vsis3_uri`, `_to_gdal_path` |
 | **Test 2** | Groundcover Encoding Conversion | `convert_to_groundcover` (`dp8a2`, `dixa2`), `inplace=True`, legacy fallback, empty arrays |
-| **Test 3** | Kernel Micro-Functions | `_bounds`, `_bounds_fast` (Numba), and `_calcmean` on discrete & degenerate histograms |
-| **Test 4** | Single-Region Invariance & Tiled Kernels | `40,000 px` parity across `refpix_numba_ibra` vs `refpix_numba` (`r_start/r_stop/c_start/c_stop`, custom `strip_h`/`col_tile_w`, `_KERNEL_U16` vs `_KERNEL_I32`) |
-| **Test 5** | Cheat-Proof Boundary Isolation | Zero cross-IBRA contamination across adjacent high/low cover bioregions |
-| **Test 6** | Ocean Masking, Empty-Block Skip & `minvalpercent` | `_build_valid_blocks` empty-block skip parity against unskipped kernel, ocean `0 → -1`, right-edge semantics, validity fraction thresholds |
-| **Test 7** | Remote Multi-IBRA `/vsis3/` End-to-End *(online)* | `500 × 500` chip from `s3://cibo-dat-oregon/GC/` + `DRCM/` reference (`--ibra`, 4 overviews, direct kernel parity) |
-| **Test 8** | Remote `--no-ibra` `/vsis3/` End-to-End *(online)* | Unconstrained `FastS3` `/vsis3/` run matching `refpix_numba` bit-for-bit |
-| **Test 9** | `FastLocal` (`os.pread` + `zlib`) & `PREDICTOR=2` Fallback | Self-verification of `PREDICTOR=1` tiles and clean fallback to `GDAL` on `PREDICTOR=2` inputs |
-| **Test 10** | Multi-Chunk Overlap & Halo-Padded AOIs | Multi-chunk (`chunksize=96`) vs single-chunk identity; `EPSG:4326` `--geojson` & projected `--bbox` halo padding (`0` mismatches vs full grid) for both `--no-ibra` and `--ibra` |
-| **Test 11** | Batch Manifest, CLI & Worker Execution | `build_shard_manifest`, `build_worker_command`, and live `run_aus_batch_worker.py` `SKIP_EXISTING` + mock S3 upload |
+| **Test 3** | Kernel Micro-Functions | `_bounds`, `_bounds_fast` (Numba), and multi-bin `_calcmean` floor rounding + empty histograms |
+| **Test 4** | Independent Brute-Force Oracle & Tiled Kernels | Histogram-free sorted-array oracle (`_oracle_refpixel`) across asymmetric `(47 × 61)` grids, `190 × 215` parity, sub-window slicing, custom tile sizes, and `_KERNEL_U16` vs `_KERNEL_I32` |
+| **Test 5** | Row & Column Boundary Isolation | Zero cross-IBRA contamination across both vertical and horizontal bioregion boundaries |
+| **Test 6** | Ocean Masking, Empty-Block Skip & `minvalpercent` | `_build_valid_blocks` empty-block skip parity against unskipped kernel + oracle, ocean `0 → -1`, validity fraction thresholds |
+| **Test 7** | Portable Real Satellite Multi-IBRA *(offline + online)* | `test_data/` `440 × 440` chip offset `(40, 40)` inside `520 × 520` ref, `FastLocal` on all bands, `4` overviews, IBRA 17 vs 58 divergence, and `0`-mismatch parity vs `_oracle_refpixel` |
+| **Test 8** | Portable Real Satellite `--no-ibra` & `--geojson` *(offline + online)* | `test_data/` `--no-ibra` vs `_oracle_refpixel` + `EPSG:4326` `aoi_nsw_ibra_boundary.geojson` subsetting (`282 × 282`), `0` mismatches in `--no-ibra` and `--ibra` modes |
+| **Test 9** | `FastLocal` Multi-Band & GDAL Fallbacks | `INTERLEAVE=BAND` 2-band `FastLocal` activation and clean fallback to `GDAL` on `PREDICTOR=2` and `INTERLEAVE=PIXEL` inputs |
+| **Test 10** | Multi-Chunk Overlap, Spatial Offset & Strict AOI Bounds | Multi-chunk (`chunksize=96`) vs single-chunk identity; offset `(40, 35)` alignment; unpadded edge mismatch check proving halo necessity; strict `--bbox`/`--geojson` bounds & tight subset dimensions |
+| **Test 11** | Batch Submission, `--save` S3 Upload & Worker Content | `load_env_file`, round-robin shard contents, Graviton SVE/`GDAL` env, `--save` upload + local delete, and pixel-level verification of the GeoTIFF uploaded by `run_aus_batch_worker.py` |
+| **Test 12** | Remote `/vsis3/` & `test_data/` Authenticity *(online)* | Streams `FastS3` `/vsis3/cibo-dat-oregon/` COGs (`--ibra` and `--no-ibra`), proves `test_data/` chips match live S3 pixels 100% bit-for-bit, and verifies `0` output mismatches |
 
 Latest verified results in the `rios` environment:
-- `python test_ibra_drcm.py --offline`: **9/9 offline tests passed in `16.95s`**.
-- `python test_ibra_drcm.py` (with AWS credentials in `us-west-2`): **All 11/11 tests passed in `23.43s`**.
+- `python test_ibra_drcm.py --offline` (with AWS credential env vars unset): **11/11 offline tests passed in `24.14s`**.
+- `python test_ibra_drcm.py` (with AWS credentials in `us-west-2`): **All 12/12 tests passed in `29.52s`**.
 
 ---
 
@@ -255,7 +261,7 @@ Latest verified results in the `rios` environment:
 | `run_aus_batch_worker.py` | AWS Batch array shard worker: local NVMe reference caching, `--skip-existing` S3 check, overlapped S3 uploads, explicit `--shard-index`/`--ibra-raster`/`--bbox`/`--geojson`/`--threads` |
 | `submit_batch_jobs.py` | AWS Batch orchestrator: S3 season discovery & `YYYYMM` filtering, round-robin sharding, S3 staging, Graviton SVE + GDAL env injection, `--smoke-test`, `--retry-shard`, `--wait`, `--watch-job-id`, `--dry-run` |
 | `maskChangeSteepIbra.py` | RIOS Stage 1 preprocessor generating 2-band NCAS/slope masked reference stats + IBRA raster |
-| `test_ibra_drcm.py` | 11-test automated verification suite (`--offline` and full `/vsis3/` modes) |
+| `test_ibra_drcm.py` | 12-test cheat-proof verification suite (`--offline` using `test_data/` + full `/vsis3/` mode) |
 
 ### Common Operational Commands
 
@@ -336,9 +342,9 @@ conda run -n rios python maskChangeSteepIbra.py \
 #### 5. Run the Verification Suite (`test_ibra_drcm.py`)
 
 ```bash
-# Offline / CI mode (runs 9 local tests; skips /vsis3/ Tests 7 & 8)
+# Offline / CI mode (runs Tests 1-11 including portable test_data/ real satellite chips; zero AWS creds needed)
 conda run -n rios python test_ibra_drcm.py --offline
 
-# Full 11-test suite including remote /vsis3/cibo-dat-oregon satellite checks
+# Full 12-test suite including live /vsis3/cibo-dat-oregon streaming & chip authenticity parity
 conda run -n rios python test_ibra_drcm.py
 ```

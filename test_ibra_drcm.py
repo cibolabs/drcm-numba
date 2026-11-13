@@ -1,16 +1,23 @@
 """
 test_ibra_drcm.py
 
-Cheat-proof, rigorous test suite for the Dynamic Reference Cover Method (DRCM) pipeline.
-Covers core kernels, I/O engines, halo-padded AOI subsetting, chunk overlap reuse,
-AWS Batch manifest/worker orchestration, and remote /vsis3/ cloud datasets:
-  - Reference: /vsis3/cibo-dat-oregon/DRCM/lztmre_aus_m198912202012_dixa2_change_slope_ibra.tif
-  - Fractional Cover: /vsis3/cibo-dat-oregon/GC/lztmre_aus_m202606202608_dp8a2_vinterim.tif
+Cheat-proof verification test suite for the Dynamic Reference Cover Method (DRCM) pipeline.
+Covers an independent histogram-free mathematical oracle, core Numba kernels,
+I/O engines (FastS3 / FastLocal / GDAL fallbacks), halo-padded AOI subsetting,
+chunk overlap reuse, portable real-satellite GeoTIFF chips (test_data/),
+AWS Batch manifest/worker orchestration, and remote /vsis3/ streaming parity:
+  - Portable real satellite chips (committed in test_data/, ~0.5 MB total):
+      * test_data/lztmre_aus_m202606202608_dp8a2_vinterim.tif (440x440, EPSG:3577)
+      * test_data/lztmre_aus_m198912202012_dixa2_change_slope_ibra.tif (520x520, offset 40,40)
+      * test_data/aoi_nsw_ibra_boundary.geojson (EPSG:4326 AOI spanning IBRA 17 & 58)
+  - Remote /vsis3/ Cibo Labs production datasets (skipped only under --offline):
+      * /vsis3/cibo-dat-oregon/DRCM/lztmre_aus_m198912202012_dixa2_change_slope_ibra.tif
+      * /vsis3/cibo-dat-oregon/GC/lztmre_aus_m202606202608_dp8a2_vinterim.tif
 
-Run full suite (including remote /vsis3/ tests 7 & 8):
+Run full suite (local + portable satellite chips + remote /vsis3/ parity):
   python test_ibra_drcm.py
 
-Run offline/local suite only (e.g., CI or Docker builds without AWS credentials):
+Run completely offline (local + portable real satellite chips in test_data/, zero AWS creds required):
   python test_ibra_drcm.py --offline
 """
 
@@ -20,6 +27,7 @@ import os
 import sys
 import tempfile
 import time
+import types
 
 import numpy as np
 from osgeo import gdal, ogr, osr
@@ -27,7 +35,6 @@ from osgeo import gdal, ogr, osr
 gdal.UseExceptions()
 ogr.UseExceptions()
 
-# Ensure repository root is on sys.path and set as working directory
 REPO_ROOT = os.path.abspath(os.path.dirname(__file__))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
@@ -49,9 +56,128 @@ from seasonalDRCMIbra import (
     run_seasonal_drcm_ibra,
 )
 
-# Remote cloud-native datasets accessed via GDAL Virtual File System (/vsis3/)
+TEST_DATA_DIR = os.path.join(REPO_ROOT, "test_data")
+LOCAL_REF_CHIP = os.path.join(TEST_DATA_DIR, "lztmre_aus_m198912202012_dixa2_change_slope_ibra.tif")
+LOCAL_GC_CHIP = os.path.join(TEST_DATA_DIR, "lztmre_aus_m202606202608_dp8a2_vinterim.tif")
+LOCAL_AOI_GEOJSON = os.path.join(TEST_DATA_DIR, "aoi_nsw_ibra_boundary.geojson")
+
 S3_REF_TIF = "/vsis3/cibo-dat-oregon/DRCM/lztmre_aus_m198912202012_dixa2_change_slope_ibra.tif"
 S3_GC_TIF = "/vsis3/cibo-dat-oregon/GC/lztmre_aus_m202606202608_dp8a2_vinterim.tif"
+
+
+def _oracle_refpixel(
+    cover,
+    ground,
+    ibra=None,
+    window=15,
+    lowerquantile=0.90,
+    upperquantile=0.95,
+    minvalpercent=0.15,
+    r_slice=None,
+    c_slice=None,
+):
+    """
+    Independent histogram-free brute-force oracle built directly from 2D numpy slices
+    and sorted value arrays (shares zero code with refpix_numba / refpix_numba_ibra).
+    """
+    nrow, ncol = cover.shape
+    hw = window // 2
+    r0_out, r1_out = (0, nrow) if r_slice is None else r_slice
+    c0_out, c1_out = (0, ncol) if c_slice is None else c_slice
+    out = np.empty((r1_out - r0_out, c1_out - c0_out), dtype=np.int8)
+
+    for oi, r in enumerate(range(r0_out, r1_out)):
+        wt = max(0, r - hw)
+        wb = min(nrow - 1, r + hw)
+        top_f = max(1, (r + 1) - hw)
+        bot_f = min(nrow, (r + 1) + hw)
+        for oj, c in enumerate(range(c0_out, c1_out)):
+            wl = max(0, c - hw)
+            wr = min(ncol - 1, c + hw)
+            sub_cov = cover[wt : wb + 1, wl : wr + 1]
+            sub_gnd = ground[wt : wb + 1, wl : wr + 1]
+
+            if ibra is not None:
+                reg = int(ibra[r, c])
+                if reg == 0:
+                    out[oi, oj] = -1
+                    continue
+                mask_reg = ibra[wt : wb + 1, wl : wr + 1] == reg
+                n_reg = int(np.sum(mask_reg))
+                if n_reg == 0:
+                    out[oi, oj] = -1
+                    continue
+                vc = sub_cov[mask_reg]
+                vg = sub_gnd[mask_reg]
+                n_valid = int(np.sum((vc > 0) & (vg > 0)))
+                if n_valid == 0 or n_valid < float(np.float32(minvalpercent)) * n_reg:
+                    out[oi, oj] = -1
+                    continue
+                pop_cov = vc[vc > 0]
+            else:
+                right_f = (c + 1) + hw
+                if (c + 1) < hw:
+                    npix = (bot_f - top_f) * right_f
+                elif right_f > ncol:
+                    npix = (bot_f - top_f) * (ncol - (c + 1))
+                else:
+                    npix = (bot_f - top_f) * window
+                vc = sub_cov.ravel()
+                vg = sub_gnd.ravel()
+                n_valid = int(np.sum((vc > 0) & (vc <= 101) & (vg > 0)))
+                if n_valid < float(np.float32(minvalpercent)) * npix:
+                    out[oi, oj] = -1
+                    continue
+                pop_cov = vc[(vc > 0) & (vc <= 101)]
+
+            n_pop = len(pop_cov)
+            if n_pop == 0:
+                out[oi, oj] = 0
+                continue
+            s_vals = np.sort(pop_cov.astype(np.int64))
+            lv = int(lowerquantile * n_pop)
+            uv = int(upperquantile * n_pop)
+            b0 = b1 = 0
+            uvfound = False
+            for cand in range(101, 0, -1):
+                cnt_le = int(np.searchsorted(s_vals, cand, side="right"))
+                if cnt_le < uv and not uvfound:
+                    b1 = cand
+                    uvfound = True
+                if cnt_le < lv:
+                    b0 = cand
+                    break
+            in_band = (vc >= b0 + 1) & (vc <= b1 + 1) & (vg > 0)
+            nsum = int(np.sum(in_band))
+            out[oi, oj] = 0 if nsum == 0 else int(np.sum(vg[in_band].astype(np.int64))) // nsum
+    return out
+
+
+def _write_test_geotiff(
+    path, bands_u8, gt, proj_wkt, nodata=None, predictor=1, block_size=128, interleave="BAND"
+):
+    """Helper to write a multi-band tiled DEFLATE uint8 GeoTIFF."""
+    h, w = bands_u8[0].shape
+    drv = gdal.GetDriverByName("GTiff")
+    opts = [
+        "COMPRESS=DEFLATE",
+        f"PREDICTOR={predictor}",
+        "TILED=YES",
+        f"BLOCKXSIZE={block_size}",
+        f"BLOCKYSIZE={block_size}",
+        f"INTERLEAVE={interleave}",
+    ]
+    ds = drv.Create(path, w, h, len(bands_u8), gdal.GDT_Byte, options=opts)
+    ds.SetGeoTransform(gt)
+    if proj_wkt:
+        ds.SetProjection(proj_wkt)
+    for idx, arr in enumerate(bands_u8, start=1):
+        b = ds.GetRasterBand(idx)
+        if nodata is not None:
+            b.SetNoDataValue(nodata)
+        b.WriteArray(arr)
+    ds.FlushCache()
+    ds = None
 
 
 def test_1_utility_functions():
@@ -102,17 +228,14 @@ def test_2_groundcover_conversion():
     dea_gc = convert_to_groundcover(dea_bare, nodata_val=255)
     assert np.array_equal(dea_gc, expected_dea)
 
-    # In-place LUT path must share exact semantics and return int8 view
     dea_copy = dea_bare.copy()
     dea_inplace = convert_to_groundcover(dea_copy, nodata_val=255, inplace=True)
     assert dea_inplace.dtype == np.int8 and np.array_equal(dea_inplace, expected_dea)
     assert np.shares_memory(dea_copy, dea_inplace)
 
-    # Non-uint8 fallback path must match LUT output bit-for-bit
     dea_u16 = convert_to_groundcover(dea_bare.astype(np.uint16), nodata_val=255)
     assert np.array_equal(dea_u16, expected_dea)
 
-    # Legacy JRSRP (dixa2): 100..200 bare -> 101..1 gc, 0 -> 0
     jrsrp_bare = np.array([[100, 125, 150], [175, 200, 0]], dtype=np.uint8)
     expected_jrsrp = np.array([[101, 76, 51], [26, 1, 0]], dtype=np.int8)
     assert np.array_equal(convert_to_groundcover(jrsrp_bare, nodata_val=0), expected_jrsrp)
@@ -120,7 +243,6 @@ def test_2_groundcover_conversion():
     assert np.array_equal(convert_to_groundcover(jrsrp_copy, nodata_val=0, inplace=True), expected_jrsrp)
     assert np.array_equal(convert_to_groundcover(jrsrp_bare.astype(np.uint16), nodata_val=0), expected_jrsrp)
 
-    # Degenerate: All-NoData and empty (0, 0)
     assert np.all(convert_to_groundcover(np.full((10, 10), 255, dtype=np.uint8), nodata_val=255) == 0)
     empty_gc = convert_to_groundcover(np.empty((0, 0), dtype=np.uint8), nodata_val=255, inplace=True)
     assert empty_gc.shape == (0, 0) and empty_gc.dtype == np.int8
@@ -141,12 +263,19 @@ def test_3_quantile_bounds_and_mean():
     b0_mid_f, b1_mid_f = refpix_numba._bounds_fast(hist, 20, 101, 0.40, 0.60)
     assert (b0_mid, b1_mid) == (49, 79) and (b0_mid_f, b1_mid_f) == (49, 79)
 
+    # Multi-bin weighted average inside [lowerb+1 .. upperb+1] + integer floor rounding
     dryhist = np.zeros(103, dtype=np.int32)
     drysum = np.zeros(103, dtype=np.int32)
-    dryhist[51] = 10
-    drysum[51] = 700
-    assert refpix_numba_ibra._calcmean(drysum, dryhist, 50, 50) == 70
-    assert refpix_numba._calcmean(drysum, dryhist, 50, 50) == 70
+    dryhist[50] = 999  # Excluded (below lowerb+1 = 51)
+    drysum[50] = 99900
+    dryhist[51] = 4
+    drysum[51] = 200
+    dryhist[52] = 6
+    drysum[52] = 407  # Total in [51, 52] = 607 // 10 = 60
+    dryhist[53] = 999  # Excluded (above upperb+1 = 52)
+    drysum[53] = 99900
+    assert refpix_numba_ibra._calcmean(drysum, dryhist, 50, 51) == 60
+    assert refpix_numba._calcmean(drysum, dryhist, 50, 51) == 60
 
     dryhist.fill(0)
     drysum.fill(0)
@@ -154,31 +283,44 @@ def test_3_quantile_bounds_and_mean():
     assert refpix_numba._calcmean(drysum, dryhist, 10, 20) == 0
     assert refpix_numba_ibra._bounds(np.zeros(103, dtype=np.int32), 101, 0.90, 0.95) == (0, 0)
     assert refpix_numba._bounds_fast(np.zeros(104, dtype=np.int32), 0, 101, 0.90, 0.95) == (0, 0)
-    print(">>> PASS: Quantile bounds and mean kernels verified across IBRA and Fast engines!")
+    print(">>> PASS: Quantile bounds, multi-bin mean, and edge cases verified!")
 
 
-def test_4_single_region_invariance_and_slicing():
-    print("\n--- Test 4: Single-Region Invariance, Tiled Slicing & Kernel Width Equivalence ---")
+def test_4_oracle_invariance_and_slicing():
+    print("\n--- Test 4: Independent Oracle Parity, Single-Region Invariance & Tiled Kernels ---")
+    rng = np.random.default_rng(2026)
+    oh, ow = 47, 61
+    cov_o = rng.integers(0, 102, size=(oh, ow), dtype=np.int8)
+    gnd_o = rng.integers(0, 102, size=(oh, ow), dtype=np.int8)
+    cov_o[5:12, 10:20] = 0
+    gnd_o[20:28, 30:40] = 0
+    ibra_o = rng.choice([0, 17, 58, 89], size=(oh, ow)).astype(np.uint8)
+
+    for win in (11, 15):
+        oracle_ib = _oracle_refpixel(cov_o, gnd_o, ibra_o, window=win, minvalpercent=0.15)
+        numba_ib = refpix_numba_ibra.refpixelfilter_ibra(cov_o, gnd_o, ibra_o, window=win, minvalpercent=0.15)
+        assert np.array_equal(oracle_ib, numba_ib), f"IBRA kernel vs independent oracle mismatch (window={win})"
+
+        oracle_gl = _oracle_refpixel(cov_o, gnd_o, None, window=win, minvalpercent=0.15)
+        numba_gl = refpix_numba.refpixelfilternodata(cov_o, gnd_o, window=win, minvalpercent=0.15)
+        assert np.array_equal(oracle_gl, numba_gl), f"Global kernel vs independent oracle mismatch (window={win})"
+
+    # Large non-square multi-tile & U16/I32 invariance
     np.random.seed(42)
-    size = 200
-    cover = np.random.randint(0, 102, size=(size, size), dtype=np.int8)
-    ground = np.random.randint(0, 102, size=(size, size), dtype=np.int8)
+    nrow, ncol = 190, 215
+    cover = np.random.randint(0, 102, size=(nrow, ncol), dtype=np.int8)
+    ground = np.random.randint(0, 102, size=(nrow, ncol), dtype=np.int8)
     cover[:30, :30] = 0
     ground[:30, :30] = 0
-    ibra = np.full((size, size), 17, dtype=np.uint8)
+    ibra = np.full((nrow, ncol), 17, dtype=np.uint8)
 
     window, lq, uq, minval = 31, 0.90, 0.95, 0.15
-
     res_global = refpix_numba.refpixelfilternodata(cover, ground, window, lq, uq, minval)
     res_ibra = refpix_numba_ibra.refpixelfilter_ibra(cover, ground, ibra, window, lq, uq, minval)
-
-    valid_count = int(np.sum(res_global > 0))
-    nodata_count = int(np.sum(res_global == -1))
-    assert valid_count > 10000 and nodata_count > 100
+    assert int(np.sum(res_global > 0)) > 10000 and int(np.sum(res_global == -1)) > 100
     assert np.array_equal(res_global, res_ibra), "res_global and res_ibra must be bit-for-bit identical"
 
-    # Verify sub-window slicing (used by halo-padded AOIs and chunking) and alternate tile sizes
-    r0, r1, c0, c1 = 23, 173, 19, 181
+    r0, r1, c0, c1 = 23, 169, 19, 191
     sliced_small_tiles = refpix_numba.refpixelfilternodata(
         cover, ground, window, lq, uq, minval,
         r_start=r0, r_stop=r1, c_start=c0, c_stop=c1,
@@ -186,43 +328,52 @@ def test_4_single_region_invariance_and_slicing():
     )
     assert np.array_equal(sliced_small_tiles, res_global[r0:r1, c0:c1]), "Sub-window or tile-size mismatch!"
 
-    # Verify int32 column-histogram kernel matches uint16 kernel bit-for-bit
     res_i32 = refpix_numba._KERNEL_I32(
-        cover, ground, window, lq, uq, minval, 0, size, 0, size, 64, 64
+        cover, ground, window, lq, uq, minval, 0, nrow, 0, ncol, 64, 64
     )
     assert np.array_equal(res_i32, res_global), "_KERNEL_I32 vs _KERNEL_U16 mismatch!"
-    print(f">>> PASS: {size * size:,} pixels, sub-window slicing, tile sizes, and U16/I32 kernels match 100%!")
+    print(">>> PASS: Independent brute-force oracle, sub-window slicing, tiles, and U16/I32 match 100%!")
 
 
 def test_5_boundary_isolation():
-    print("\n--- Test 5: Cheat-Proof Boundary Isolation Test ---")
+    print("\n--- Test 5: Row & Column Boundary Isolation Test ---")
     size = 100
     cover = np.zeros((size, size), dtype=np.int8)
     ground = np.zeros((size, size), dtype=np.int8)
     ibra = np.zeros((size, size), dtype=np.uint8)
 
-    cover[:, :50] = 80
-    ground[:, :50] = 70
-    ibra[:, :50] = 10
-    cover[::6, :50] = 95
-    ground[::6, :50] = 90
+    # Quadrant-specific IBRA regions + gradients so axis swaps cannot hide
+    cover[:50, :50] = 80
+    ground[:50, :50] = 70
+    ibra[:50, :50] = 10
+    cover[:50:6, :50] = 95
+    ground[:50:6, :50] = 90
 
-    cover[:, 50:] = 20
-    ground[:, 50:] = 15
-    ibra[:, 50:] = 20
-    cover[::6, 50:] = 35
-    ground[::6, 50:] = 30
+    cover[:50, 50:] = 20
+    ground[:50, 50:] = 15
+    ibra[:50, 50:] = 20
+    cover[:50:6, 50:] = 35
+    ground[:50:6, 50:] = 30
+
+    cover[50:, :] = 55
+    ground[50:, :] = 45
+    ibra[50:, :] = 30
+    cover[50::6, :] = 65
+    ground[50::6, :] = 60
 
     window, lq, uq, minval = 21, 0.90, 0.95, 0.05
     res_ibra = refpix_numba_ibra.refpixelfilter_ibra(cover, ground, ibra, window, lq, uq, minval)
     res_global = refpix_numba.refpixelfilternodata(cover, ground, window, lq, uq, minval)
 
-    assert ground[55, 49] == 70 and res_ibra[55, 49] == 90
-    assert ground[55, 50] == 15 and res_ibra[55, 50] == 30
-    assert np.all(res_ibra[20:80, 48:50] == 90)
-    assert np.all(res_ibra[20:80, 50:52] == 30)
-    assert np.all(res_global[20:80, 50:52] > 60)
-    print(">>> PASS: Zero cross-boundary contamination strictly proven!")
+    # Vertical split check (IBRA 10 vs 20 across col 49/50)
+    assert np.all(res_ibra[10:40, 48:50] == 90)
+    assert np.all(res_ibra[10:40, 50:52] == 30)
+    assert np.all(res_global[10:40, 50:52] > 60)
+
+    # Horizontal split check (IBRA 20 vs 30 across row 49/50)
+    assert np.all(res_ibra[48:50, 60:90] == 30)
+    assert np.all(res_ibra[50:52, 60:90] == 60)
+    print(">>> PASS: Zero horizontal or vertical cross-boundary contamination proven!")
 
 
 def test_6_ocean_and_valid_fraction():
@@ -248,7 +399,6 @@ def test_6_ocean_and_valid_fraction():
     assert res_insuff[22, 22] == -1 and res_suff[22, 22] == 50
     assert res_insuff[5, 5] == -1 and res_suff[5, 5] == -1
 
-    # Verify refpix_numba coarse 256x256 empty-block skipping preserves exact edge/interior semantics
     sparse_h, sparse_w = 600, 600
     sp_cov = np.zeros((sparse_h, sparse_w), dtype=np.int8)
     sp_gnd = np.zeros((sparse_h, sparse_w), dtype=np.int8)
@@ -258,7 +408,6 @@ def test_6_ocean_and_valid_fraction():
     blocks = refpix_numba._build_valid_blocks(sp_cov, sp_gnd, 256)
     assert blocks[0, 0] == 0 and blocks[1, 1] == 1
 
-    # Compare empty-block-skipped run against unskipped run (forced via distant corner pixel)
     sp_fast = refpix_numba.refpixelfilternodata(sp_cov, sp_gnd, window=31, minvalpercent=0.15)
     sp_cov_unskipped = sp_cov.copy()
     sp_cov_unskipped[0, 0] = 50
@@ -271,130 +420,138 @@ def test_6_ocean_and_valid_fraction():
     assert np.all(sp_fast[:, -1] == 0)
     assert np.array_equal(sp_fast[32:, :], sp_unskipped[32:, :])
     assert np.array_equal(sp_fast[:, 32:], sp_unskipped[:, 32:])
+    assert np.all(sp_fast[300:360, 300:360] == 64)
 
-    # Verify parity with IBRA engine where minvalpercent (0.001 -> >=1 valid px) is invariant to 30*31 vs 31*31 denom
-    sp_fast_all = refpix_numba.refpixelfilternodata(sp_cov, sp_gnd, window=31, minvalpercent=0.001)
-    sp_ibra_all = refpix_numba_ibra.refpixelfilter_ibra(
-        sp_cov, sp_gnd, np.ones((sparse_h, sparse_w), dtype=np.uint8), window=31, minvalpercent=0.001
+    # Check boundary of sparse island against independent brute-force oracle
+    oracle_edge = _oracle_refpixel(
+        sp_cov, sp_gnd, None, window=31, minvalpercent=0.15, r_slice=(280, 320), c_slice=(290, 340)
     )
-    assert np.array_equal(sp_fast_all[:, :-1], sp_ibra_all[:, :-1])
+    assert np.array_equal(sp_fast[280:320, 290:340], oracle_edge)
     print(">>> PASS: Ocean masking, empty-block skip, and validity thresholds verified!")
 
 
-def test_7_satellite_multi_ibra_end_to_end():
-    print("\n--- Test 7: Real Satellite Multi-IBRA End-to-End Test (via /vsis3/) ---")
+def test_7_local_satellite_multi_ibra():
+    print("\n--- Test 7: Portable Real Satellite Multi-IBRA Test (test_data/ chips, offset 40,40) ---")
+    assert os.path.exists(LOCAL_GC_CHIP) and os.path.exists(LOCAL_REF_CHIP)
     with tempfile.TemporaryDirectory(prefix="drcm_test7_") as tmpdir:
-        out_drcm_tif = os.path.join(tmpdir, "test_full_suite_drcm.tif")
+        out_tif = os.path.join(tmpdir, "local_sat_multi_ibra.tif")
         run_seasonal_drcm_ibra(
-            input_groundcover=S3_GC_TIF,
-            percentile_file=S3_REF_TIF,
-            output_file=out_drcm_tif,
-            window=101,
-            test_chip=[90000, 80000, 500, 500],
+            input_groundcover=LOCAL_GC_CHIP,
+            percentile_file=LOCAL_REF_CHIP,
+            output_file=out_tif,
+            window=61,
+            chunksize=200,
         )
 
-        ds_res = gdal.Open(out_drcm_tif)
+        ds_res = gdal.Open(out_tif)
+        ds_gc = gdal.Open(LOCAL_GC_CHIP)
+        ds_ref = gdal.Open(LOCAL_REF_CHIP)
         assert ds_res.RasterCount == 2
-        b1_res = ds_res.GetRasterBand(1)
-        b2_res = ds_res.GetRasterBand(2)
-        assert "IBRA-Constrained" in b1_res.GetDescription()
-        assert "IBRA-Constrained" in b2_res.GetDescription()
-        assert b1_res.GetOverviewCount() == 4
-        assert b2_res.GetOverviewCount() == 4
+        assert ds_res.RasterXSize == ds_gc.RasterXSize == 440
+        assert ds_res.RasterYSize == ds_gc.RasterYSize == 440
+        assert ds_res.GetGeoTransform() == ds_gc.GetGeoTransform()
 
-        dgc = b1_res.ReadAsArray()
-        ref_scaled = b2_res.ReadAsArray()
-        assert np.sum(dgc > 0) > 200000 and np.sum(ref_scaled > 0) > 200000
+        b1, b2 = ds_res.GetRasterBand(1), ds_res.GetRasterBand(2)
+        assert "IBRA-Constrained" in b1.GetDescription()
+        assert "IBRA-Constrained" in b2.GetDescription()
+        assert b1.GetOverviewCount() == 4 and b2.GetOverviewCount() == 4
 
-        ds_ref = gdal.Open(S3_REF_TIF)
-        perc = ds_ref.GetRasterBand(1).ReadAsArray(90000, 80000, 500, 500).astype(np.int8)
-        ibra = ds_ref.GetRasterBand(2).ReadAsArray(90000, 80000, 500, 500)
-        ds_gc = gdal.Open(S3_GC_TIF)
-        bare = ds_gc.GetRasterBand(1).ReadAsArray(90000, 80000, 500, 500)
+        dgc = b1.ReadAsArray()
+        ref_scaled = b2.ReadAsArray()
+        assert int(np.sum(dgc > 0)) > 120000 and int(np.sum(ref_scaled > 0)) > 120000
+
+        # Offset alignment check: GC starts at pixel (40, 40) inside REF chip
+        perc = ds_ref.GetRasterBand(1).ReadAsArray(40, 40, 440, 440).astype(np.int8)
+        ibra = ds_ref.GetRasterBand(2).ReadAsArray(40, 40, 440, 440)
+        bare = ds_gc.GetRasterBand(1).ReadAsArray()
         gc = convert_to_groundcover(bare)
 
-        direct_ref = refpix_numba_ibra.refpixelfilter_ibra(perc, gc, ibra, window=101)
-        direct_ref_scaled = np.where(direct_ref < 0, 0, 100 + direct_ref).astype(np.uint8)
-        direct_dgc = np.where((direct_ref < 0) | (gc == 0), 0, 100 + gc - direct_ref).astype(np.uint8)
+        # Verify against independent histogram-free oracle across real IBRA boundary (rows 150..290, cols 150..290)
+        oracle_sub = _oracle_refpixel(
+            perc, gc, ibra, window=61, r_slice=(150, 290), c_slice=(150, 290)
+        )
+        oracle_ref_sub = np.where(oracle_sub < 0, 0, 100 + oracle_sub).astype(np.uint8)
+        oracle_dgc_sub = np.where((oracle_sub < 0) | (gc[150:290, 150:290] == 0), 0, 100 + gc[150:290, 150:290] - oracle_sub).astype(np.uint8)
+        assert np.array_equal(ref_scaled[150:290, 150:290], oracle_ref_sub)
+        assert np.array_equal(dgc[150:290, 150:290], oracle_dgc_sub)
 
-        assert np.array_equal(ref_scaled, direct_ref_scaled)
-        assert np.array_equal(dgc, direct_dgc)
-
-        unique_regions = np.unique(ibra)
-        assert 17 in unique_regions and 58 in unique_regions
-        mean_17 = np.mean(ref_scaled[(ibra == 17) & (ref_scaled > 0)])
-        mean_58 = np.mean(ref_scaled[(ibra == 58) & (ref_scaled > 0)])
+        # Verify real Darling Riverine Plains (17) vs Cobar Peneplain (58) statistical divergence
+        assert 17 in np.unique(ibra) and 58 in np.unique(ibra)
+        mean_17 = float(np.mean(ref_scaled[(ibra == 17) & (ref_scaled > 0)]))
+        mean_58 = float(np.mean(ref_scaled[(ibra == 58) & (ref_scaled > 0)]))
         assert abs(mean_17 - mean_58) > 0.1
-        ds_res = ds_ref = ds_gc = None
-    print(">>> PASS: Real satellite multi-IBRA DRCM run (via /vsis3/) verified!")
+        ds_res = ds_gc = ds_ref = None
+    print(">>> PASS: Real satellite multi-IBRA chip + spatial offset (40,40) + oracle parity verified!")
 
 
-def test_8_satellite_no_ibra_mode():
-    print("\n--- Test 8: Single Global Histogram Mode (--no-ibra via /vsis3/) ---")
+def test_8_local_satellite_no_ibra_and_geojson():
+    print("\n--- Test 8: Portable Real Satellite --no-ibra & Halo-Padded GeoJSON Test ---")
+    assert os.path.exists(LOCAL_AOI_GEOJSON)
     with tempfile.TemporaryDirectory(prefix="drcm_test8_") as tmpdir:
-        out_no_ibra = os.path.join(tmpdir, "test_no_ibra_eval.tif")
+        full_no_ibra = os.path.join(tmpdir, "local_sat_no_ibra.tif")
+        full_ibra = os.path.join(tmpdir, "local_sat_ibra.tif")
+        aoi_no_ibra = os.path.join(tmpdir, "aoi_no_ibra.tif")
+        aoi_ibra = os.path.join(tmpdir, "aoi_ibra.tif")
+
         run_seasonal_drcm_ibra(
-            input_groundcover=S3_GC_TIF,
-            percentile_file=S3_REF_TIF,
-            output_file=out_no_ibra,
-            window=101,
-            test_chip=[90000, 80000, 500, 500],
-            no_ibra=True,
-            no_overviews=True,
+            LOCAL_GC_CHIP, LOCAL_REF_CHIP, output_file=full_no_ibra,
+            window=61, chunksize=200, no_ibra=True, no_overviews=True,
+        )
+        run_seasonal_drcm_ibra(
+            LOCAL_GC_CHIP, LOCAL_REF_CHIP, output_file=full_ibra,
+            window=61, chunksize=200, no_ibra=False, no_overviews=True,
+        )
+        run_seasonal_drcm_ibra(
+            LOCAL_GC_CHIP, LOCAL_REF_CHIP, output_file=aoi_no_ibra,
+            window=61, chunksize=140, geojson=LOCAL_AOI_GEOJSON, no_ibra=True, no_overviews=True,
+        )
+        run_seasonal_drcm_ibra(
+            LOCAL_GC_CHIP, LOCAL_REF_CHIP, output_file=aoi_ibra,
+            window=61, chunksize=140, geojson=LOCAL_AOI_GEOJSON, no_ibra=False, no_overviews=True,
         )
 
-        ds1 = gdal.Open(out_no_ibra)
-        assert "Unconstrained" in ds1.GetRasterBand(1).GetDescription()
-        assert "Unconstrained" in ds1.GetRasterBand(2).GetDescription()
-        dgc1 = ds1.GetRasterBand(1).ReadAsArray()
-        ref1 = ds1.GetRasterBand(2).ReadAsArray()
+        ds_full_ni = gdal.Open(full_no_ibra)
+        assert "Unconstrained" in ds_full_ni.GetRasterBand(1).GetDescription()
+        dgc_ni = ds_full_ni.GetRasterBand(1).ReadAsArray()
+        ref_ni = ds_full_ni.GetRasterBand(2).ReadAsArray()
 
-        in_ds = gdal.Open(S3_GC_TIF)
-        ref_ds = gdal.Open(S3_REF_TIF)
-        bare = in_ds.GetRasterBand(1).ReadAsArray(90000, 80000, 500, 500)
-        gc = convert_to_groundcover(bare)
-        perc = ref_ds.GetRasterBand(1).ReadAsArray(90000, 80000, 500, 500).astype(np.int8)
+        ds_gc = gdal.Open(LOCAL_GC_CHIP)
+        ds_ref = gdal.Open(LOCAL_REF_CHIP)
+        gt = ds_gc.GetGeoTransform()
+        perc = ds_ref.GetRasterBand(1).ReadAsArray(40, 40, 440, 440).astype(np.int8)
+        gc = convert_to_groundcover(ds_gc.GetRasterBand(1).ReadAsArray())
 
-        direct_ref = refpix_numba.refpixelfilternodata(perc, gc, window=101)
-        direct_ref_scaled = np.where(direct_ref < 0, 0, 100 + direct_ref).astype(np.uint8)
-        direct_dgc = np.where((direct_ref < 0) | (gc == 0), 0, 100 + gc - direct_ref).astype(np.uint8)
+        # Independent oracle parity on interior real satellite pixels
+        oracle_sub = _oracle_refpixel(perc, gc, None, window=61, r_slice=(160, 280), c_slice=(160, 280))
+        exp_ref = np.where(oracle_sub < 0, 0, 100 + oracle_sub).astype(np.uint8)
+        exp_dgc = np.where((oracle_sub < 0) | (gc[160:280, 160:280] == 0), 0, 100 + gc[160:280, 160:280] - oracle_sub).astype(np.uint8)
+        assert np.array_equal(ref_ni[160:280, 160:280], exp_ref)
+        assert np.array_equal(dgc_ni[160:280, 160:280], exp_dgc)
 
-        assert np.array_equal(dgc1, direct_dgc)
-        assert np.array_equal(ref1, direct_ref_scaled)
-        ds1 = in_ds = ref_ds = None
-    print(">>> PASS: --no-ibra unconstrained mode (via /vsis3/) matches baseline 100%!")
-
-
-def _write_test_geotiff(path, bands_u8, gt, proj_wkt, nodata=None, predictor=1, block_size=128):
-    """Helper to write a multi-band tiled DEFLATE uint8 GeoTIFF."""
-    h, w = bands_u8[0].shape
-    drv = gdal.GetDriverByName("GTiff")
-    opts = [
-        "COMPRESS=DEFLATE",
-        f"PREDICTOR={predictor}",
-        "TILED=YES",
-        f"BLOCKXSIZE={block_size}",
-        f"BLOCKYSIZE={block_size}",
-    ]
-    ds = drv.Create(path, w, h, len(bands_u8), gdal.GDT_Byte, options=opts)
-    ds.SetGeoTransform(gt)
-    if proj_wkt:
-        ds.SetProjection(proj_wkt)
-    for idx, arr in enumerate(bands_u8, start=1):
-        b = ds.GetRasterBand(idx)
-        if nodata is not None:
-            b.SetNoDataValue(nodata)
-        b.WriteArray(arr)
-    ds.FlushCache()
-    ds = None
+        # Verify halo-padded EPSG:4326 GeoJSON AOI actually subsetted tightly and matched 0-diff
+        ds_full_ib = gdal.Open(full_ibra)
+        for full_ds, aoi_path in ((ds_full_ni, aoi_no_ibra), (ds_full_ib, aoi_ibra)):
+            sub_ds = gdal.Open(aoi_path)
+            sgt = sub_ds.GetGeoTransform()
+            sw, sh = sub_ds.RasterXSize, sub_ds.RasterYSize
+            assert 275 <= sw <= 290 and 275 <= sh <= 290, f"Unexpected AOI subset size: {sw}x{sh}"
+            x0 = int(round((sgt[0] - gt[0]) / gt[1]))
+            y0 = int(round((sgt[3] - gt[3]) / gt[5]))
+            assert 75 <= x0 <= 85 and 75 <= y0 <= 85
+            assert np.array_equal(sub_ds.GetRasterBand(1).ReadAsArray(), full_ds.GetRasterBand(1).ReadAsArray()[y0 : y0 + sh, x0 : x0 + sw])
+            assert np.array_equal(sub_ds.GetRasterBand(2).ReadAsArray(), full_ds.GetRasterBand(2).ReadAsArray()[y0 : y0 + sh, x0 : x0 + sw])
+            sub_ds = None
+        ds_full_ni = ds_full_ib = ds_gc = ds_ref = None
+    print(">>> PASS: Real satellite --no-ibra + GeoJSON halo AOI verified offline!")
 
 
 def test_9_local_fast_tiled_reader_and_predictor_fallback():
-    print("\n--- Test 9: FastLocal (os.pread + zlib) Tiled Reader & PREDICTOR=2 Fallback ---")
+    print("\n--- Test 9: FastLocal (os.pread + zlib) Multi-Band & Fallback Verification ---")
     with tempfile.TemporaryDirectory(prefix="drcm_test9_") as tmpdir:
         local_in = os.path.join(tmpdir, "in_pred1.tif")
         local_pred2 = os.path.join(tmpdir, "in_pred2.tif")
-        local_ref = os.path.join(tmpdir, "ref.tif")
+        local_ref_band = os.path.join(tmpdir, "ref_band.tif")
+        local_ref_pixel = os.path.join(tmpdir, "ref_pixel.tif")
         local_out = os.path.join(tmpdir, "out.tif")
 
         rng = np.random.default_rng(12345)
@@ -403,36 +560,43 @@ def test_9_local_fast_tiled_reader_and_predictor_fallback():
         bare[20:40, 20:40] = 255
         ref_arr = rng.integers(1, 102, size=(h, w), dtype=np.uint8)
         ref_arr[128:256, 128:256] = 0
+        ibra_arr = np.full((h, w), 17, dtype=np.uint8)
         gt = (0.0, 30.0, 0.0, 0.0, 0.0, -30.0)
 
-        _write_test_geotiff(local_in, [bare], gt, "", nodata=255, predictor=1, block_size=128)
-        _write_test_geotiff(local_pred2, [bare], gt, "", nodata=255, predictor=2, block_size=128)
-        _write_test_geotiff(local_ref, [ref_arr], gt, "", nodata=0, predictor=1, block_size=128)
+        _write_test_geotiff(local_in, [bare], gt, "", nodata=255, predictor=1, block_size=128, interleave="BAND")
+        _write_test_geotiff(local_pred2, [bare], gt, "", nodata=255, predictor=2, block_size=128, interleave="BAND")
+        _write_test_geotiff(local_ref_band, [ref_arr, ibra_arr], gt, "", nodata=0, predictor=1, block_size=128, interleave="BAND")
+        _write_test_geotiff(local_ref_pixel, [ref_arr, ibra_arr], gt, "", nodata=0, predictor=1, block_size=128, interleave="PIXEL")
 
-        # 1. Verify FastLocal activation and exact pixel reads
-        rdr = _SequentialBandReader(local_in, local_ref, io_workers=4)
+        # 1. INTERLEAVE=BAND 2-band FastLocal activates cleanly on input and both ref/ibra bands
+        rdr = _SequentialBandReader(local_in, local_ref_band, ibra_band_idx=2, io_workers=4)
         try:
             assert rdr.in_fast is not None and rdr.in_fast.local_path == local_in
-            assert rdr.ref_fast is not None and rdr.ref_fast.local_path == local_ref
+            assert rdr.ref_fast is not None and rdr.ref_fast.local_path == local_ref_band
+            assert rdr.ibra_fast is not None and rdr.ibra_fast.local_path == local_ref_band
             assert np.array_equal(rdr.read_in_window((0, 0, w, h)), bare)
-            got_ref, _ = rdr.read_ref_windows((0, 0, w, h), need_ibra=False)
+            got_ref, got_ib = rdr.read_ref_windows((0, 0, w, h), need_ibra=True)
             assert np.array_equal(got_ref, ref_arr.view(np.int8))
+            assert np.array_equal(got_ib, ibra_arr)
         finally:
             rdr.close()
 
-        # 2. Verify PREDICTOR=2 self-verification fallback cleanly drops back to GDAL
-        rdr2 = _SequentialBandReader(local_pred2, local_ref, io_workers=4)
+        # 2. PREDICTOR=2 input and INTERLEAVE=PIXEL 2-band ref cleanly fall back to GDAL
+        rdr2 = _SequentialBandReader(local_pred2, local_ref_pixel, ibra_band_idx=2, io_workers=4)
         try:
-            assert rdr2.in_fast is None, "PREDICTOR=2 input must safely fall back to GDAL reader"
-            assert rdr2.ref_fast is not None
+            assert rdr2.in_fast is None, "PREDICTOR=2 must fall back to GDAL"
+            assert rdr2.ref_fast is None, "INTERLEAVE=PIXEL 2-band must fall back to GDAL"
+            assert rdr2.ibra_fast is None
             assert np.array_equal(rdr2.read_in_window((0, 0, w, h)), bare)
+            got_ref2, got_ib2 = rdr2.read_ref_windows((0, 0, w, h), need_ibra=True)
+            assert np.array_equal(got_ref2, ref_arr.view(np.int8)) and np.array_equal(got_ib2, ibra_arr)
         finally:
             rdr2.close()
 
-        # 3. Verify end-to-end local pipeline matches direct Numba kernel
+        # 3. End-to-end local FastLocal pipeline vs direct kernel
         run_seasonal_drcm_ibra(
             input_groundcover=local_in,
-            percentile_file=local_ref,
+            percentile_file=local_ref_band,
             output_file=local_out,
             window=21,
             chunksize=150,
@@ -449,11 +613,11 @@ def test_9_local_fast_tiled_reader_and_predictor_fallback():
         exp_ref = np.where(direct_ref < 0, 0, 100 + direct_ref).astype(np.uint8)
         exp_dgc = np.where((direct_ref < 0) | (gc == 0), 0, 100 + gc - direct_ref).astype(np.uint8)
         assert np.array_equal(dgc, exp_dgc) and np.array_equal(ref_scaled, exp_ref)
-    print(">>> PASS: FastLocal os.pread + PREDICTOR=2 GDAL fallback verified!")
+    print(">>> PASS: FastLocal BAND activation + PREDICTOR=2/PIXEL fallback verified!")
 
 
 def test_10_multichunk_and_halo_aoi_parity():
-    print("\n--- Test 10: Multi-Chunk Overlap Reuse & Halo-Padded --bbox / --geojson Parity ---")
+    print("\n--- Test 10: Multi-Chunk Overlap, Spatial Offset Alignment & Strict Halo AOI Parity ---")
     with tempfile.TemporaryDirectory(prefix="drcm_test10_") as tmpdir:
         srs_3577 = osr.SpatialReference()
         srs_3577.ImportFromEPSG(3577)
@@ -464,20 +628,24 @@ def test_10_multichunk_and_halo_aoi_parity():
         srs_4326.ImportFromEPSG(4326)
         srs_4326.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
 
+        # Larger reference grid so input_groundcover has non-zero alignment offset (col=40, row=35)
+        ref_h, ref_w = 500, 520
+        off_x, off_y = 40, 35
         h, w = 420, 440
-        gt = (1000000.0, 30.0, 0.0, -3200000.0, 0.0, -30.0)
+        ref_gt = (1000000.0, 30.0, 0.0, -3200000.0, 0.0, -30.0)
+        in_gt = (ref_gt[0] + off_x * 30.0, 30.0, 0.0, ref_gt[3] - off_y * 30.0, 0.0, -30.0)
+
         rng = np.random.default_rng(777)
         bare = rng.integers(5, 95, size=(h, w), dtype=np.uint8)
         bare[:40, :40] = 255
-        perc = rng.integers(10, 101, size=(h, w), dtype=np.uint8)
-        ibra = np.where(np.arange(w)[None, :] < 220, 17, 58).astype(np.uint8)
+        perc = rng.integers(10, 101, size=(ref_h, ref_w), dtype=np.uint8)
+        ibra = np.where(np.arange(ref_w)[None, :] < (off_x + 220), 17, 58).astype(np.uint8)
 
         in_tif = os.path.join(tmpdir, "aus_synth_dp8a2.tif")
         ref_tif = os.path.join(tmpdir, "aus_synth_ref_ibra.tif")
-        _write_test_geotiff(in_tif, [bare], gt, wkt_3577, nodata=255, predictor=1, block_size=128)
-        _write_test_geotiff(ref_tif, [perc, ibra], gt, wkt_3577, nodata=0, predictor=1, block_size=128)
+        _write_test_geotiff(in_tif, [bare], in_gt, wkt_3577, nodata=255, predictor=1, block_size=128, interleave="BAND")
+        _write_test_geotiff(ref_tif, [perc, ibra], ref_gt, wkt_3577, nodata=0, predictor=1, block_size=128, interleave="BAND")
 
-        # 1. Verify multi-chunk overlap reuse (chunksize=96 -> 5 chunks) vs single-chunk (chunksize=1024)
         for no_ibra in (True, False):
             tag = "noibra" if no_ibra else "ibra"
             full_1 = os.path.join(tmpdir, f"full_single_{tag}.tif")
@@ -496,14 +664,26 @@ def test_10_multichunk_and_halo_aoi_parity():
                 assert np.array_equal(d1.GetRasterBand(b).ReadAsArray(), dn.GetRasterBand(b).ReadAsArray())
             d1 = dn = None
 
-        # 2. Verify halo-padded --bbox and EPSG:4326 --geojson match full-grid slice 100% bit-for-bit
-        # Choose AOI spanning columns 150..310 and rows 120..300 (crosses IBRA boundary at col 220!)
-        minx = gt[0] + 150 * gt[1]
-        maxx = gt[0] + 310 * gt[1]
-        maxy = gt[3] + 120 * gt[5]
-        miny = gt[3] + 300 * gt[5]
+        # AOI cols 150..310 (160 px wide), rows 120..300 (180 px tall) crossing IBRA col 220
+        minx = in_gt[0] + 150 * 30.0
+        maxx = in_gt[0] + 310 * 30.0
+        maxy = in_gt[3] - 120 * 30.0
+        miny = in_gt[3] - 300 * 30.0
 
-        # Build EPSG:4326 GeoJSON polygon corresponding to exact projected envelope corners
+        # Prove halo padding IS genuinely required (unpadded test_chip misses border pixels!)
+        nopad_tif = os.path.join(tmpdir, "nopad_chip.tif")
+        run_seasonal_drcm_ibra(
+            in_tif, ref_tif, output_file=nopad_tif, window=31, chunksize=200,
+            test_chip=[150, 120, 160, 180], no_ibra=True, no_overviews=True,
+        )
+        np_ds = gdal.Open(nopad_tif)
+        full_ds_tmp = gdal.Open(os.path.join(tmpdir, "full_single_noibra.tif"))
+        assert not np.array_equal(
+            np_ds.GetRasterBand(1).ReadAsArray()[0, :],
+            full_ds_tmp.GetRasterBand(1).ReadAsArray()[120, 150:310],
+        ), "Unpadded crop unexpectedly matched haloed interior!"
+        np_ds = full_ds_tmp = None
+
         to_4326 = osr.CoordinateTransformation(srs_3577, srs_4326)
         ring_coords = []
         for px, py in ((minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy), (minx, miny)):
@@ -543,64 +723,82 @@ def test_10_multichunk_and_halo_aoi_parity():
             for p in (out_bbox, out_gj):
                 sub_ds = gdal.Open(p)
                 sgt = sub_ds.GetGeoTransform()
-                x0 = int(round((sgt[0] - gt[0]) / gt[1]))
-                y0 = int(round((sgt[3] - gt[3]) / gt[5]))
                 sw, sh = sub_ds.RasterXSize, sub_ds.RasterYSize
-                assert np.array_equal(sub_ds.GetRasterBand(1).ReadAsArray(), full_b1[y0:y0 + sh, x0:x0 + sw]), (
-                    f"Band 1 halo mismatch for {p}"
-                )
-                assert np.array_equal(sub_ds.GetRasterBand(2).ReadAsArray(), full_b2[y0:y0 + sh, x0:x0 + sw]), (
-                    f"Band 2 halo mismatch for {p}"
-                )
+                # Strict anti-cheat checks: actually subsetted + strictly covers requested AOI + tight fit
+                assert 159 <= sw <= 165 and 179 <= sh <= 185, f"Subset dims {sw}x{sh} out of expected tight AOI range"
+                out_minx, out_maxx = sgt[0], sgt[0] + sw * sgt[1]
+                out_maxy, out_miny = sgt[3], sgt[3] + sh * sgt[5]
+                assert out_minx <= minx + 1e-6 and out_maxx >= maxx - 1e-6
+                assert out_maxy >= maxy - 1e-6 and out_miny <= miny + 1e-6
+                x0 = int(round((sgt[0] - in_gt[0]) / in_gt[1]))
+                y0 = int(round((sgt[3] - in_gt[3]) / in_gt[5]))
+                assert np.array_equal(sub_ds.GetRasterBand(1).ReadAsArray(), full_b1[y0 : y0 + sh, x0 : x0 + sw])
+                assert np.array_equal(sub_ds.GetRasterBand(2).ReadAsArray(), full_b2[y0 : y0 + sh, x0 : x0 + sw])
                 sub_ds = None
-    print(">>> PASS: Multi-chunk overlap reuse & halo-padded --bbox/--geojson parity verified (0 mismatches)!")
+    print(">>> PASS: Multi-chunk overlap, offset (40,35) alignment & strict halo AOI parity verified!")
 
 
 def test_11_batch_worker_and_submission():
-    print("\n--- Test 11: Batch Submission Manifest/Command & Worker Shard Execution ---")
-    # 1. Test season filtering, round-robin sharding, and command construction
-    sample_items = [
-        ("GC/lztmre_aus_m200909200911_dp8a2.tif", 10_000_000_000),
-        ("GC/lztmre_aus_m200912201002_dp8a2.tif", 12_000_000_000),
-        ("GC/lztmre_aus_m201003201005_dp8a2.tif", 13_000_000_000),
-        ("GC/lztmre_aus_m202606202608_dp8a2_vinterim.tif", 14_000_000_000),
-        ("GC/unrelated_file.tif", 1_000_000),
-    ]
-    filtered = submit_batch_jobs.filter_season_items(sample_items, start_ym="200912", end_ym="202608")
-    assert [k for k, _ in filtered] == [
-        "GC/lztmre_aus_m200912201002_dp8a2.tif",
-        "GC/lztmre_aus_m201003201005_dp8a2.tif",
-        "GC/lztmre_aus_m202606202608_dp8a2_vinterim.tif",
-    ]
-
-    manifest, shard_bytes = submit_batch_jobs.build_shard_manifest(
-        filtered, num_shards=2, geojson="field.geojson", output_prefix="DRCM/nsw_field"
-    )
-    assert manifest["num_shards"] == 2
-    assert manifest["output_prefix"] == "DRCM/nsw_field/"
-    assert manifest["geojson"] == "field.geojson"
-    assert len(manifest["shards"][0]) == 2 and len(manifest["shards"][1]) == 1
-    assert sum(shard_bytes) == 39_000_000_000
-
-    # Single-shard / retry commands must pass explicit --shard-index
-    cmd_single = submit_batch_jobs.build_worker_command(
-        "s3://cibo-dat-oregon/DRCM/_batch_scripts/v4", explicit_shard_index=6
-    )
-    assert "--shard-index 6" in cmd_single[2]
-    cmd_array = submit_batch_jobs.build_worker_command("s3://cibo-dat-oregon/DRCM/_batch_scripts/v4")
-    assert "--shard-index" not in cmd_array[2]
-
-    env_map = {e["name"]: e["value"] for e in submit_batch_jobs.build_batch_environment()}
-    assert env_map["NUMBA_CPU_NAME"] == "generic"
-    assert env_map["NUMBA_CPU_FEATURES"] == "+neon"
-    assert "0" in env_map["GDAL_HTTP_RETRY_CODES"].split(",")
-
-    # 2. Test run_aus_batch_worker manifest parsing, skip-existing, and shard execution locally
+    print("\n--- Test 11: Batch Submission, S3 --save/-o Upload & Worker Content Verification ---")
     with tempfile.TemporaryDirectory(prefix="drcm_test11_") as tmpdir:
+        # 1. Verify load_env_file parsing (spaces around =, quotes, comments, no-clobber)
+        env_p = os.path.join(tmpdir, "test.env")
+        with open(env_p, "w", encoding="utf-8") as f:
+            f.write('# comment\nTEST_DRCM_K1 = "val_quoted"\nTEST_DRCM_K2=plain_val\nTEST_DRCM_KEEP = "override"\n')
+        try:
+            os.environ.pop("TEST_DRCM_K1", None)
+            os.environ.pop("TEST_DRCM_K2", None)
+            os.environ["TEST_DRCM_KEEP"] = "existing"
+            submit_batch_jobs.load_env_file(env_p)
+            assert os.environ["TEST_DRCM_K1"] == "val_quoted" and os.environ["TEST_DRCM_K2"] == "plain_val"
+            assert os.environ["TEST_DRCM_KEEP"] == "existing"
+        finally:
+            os.environ.pop("TEST_DRCM_K1", None)
+            os.environ.pop("TEST_DRCM_K2", None)
+            os.environ.pop("TEST_DRCM_KEEP", None)
+
+        # 2. Exact round-robin sharding, filtering, command construction & Graviton env
+        sample_items = [
+            ("GC/lztmre_aus_m200909200911_dp8a2.tif", 10_000_000_000),
+            ("GC/lztmre_aus_m200912201002_dp8a2.tif", 12_000_000_000),
+            ("GC/lztmre_aus_m201003201005_dp8a2.tif", 13_000_000_000),
+            ("GC/lztmre_aus_m202606202608_dp8a2_vinterim.tif", 14_000_000_000),
+            ("GC/unrelated_file.tif", 1_000_000),
+        ]
+        filtered = submit_batch_jobs.filter_season_items(sample_items, start_ym="200912", end_ym="202608")
+        assert [k for k, _ in filtered] == [
+            "GC/lztmre_aus_m200912201002_dp8a2.tif",
+            "GC/lztmre_aus_m201003201005_dp8a2.tif",
+            "GC/lztmre_aus_m202606202608_dp8a2_vinterim.tif",
+        ]
+
+        manifest, shard_bytes = submit_batch_jobs.build_shard_manifest(
+            filtered, num_shards=2, geojson="field.geojson", output_prefix="DRCM/nsw_field"
+        )
+        assert manifest["shards"][0] == [
+            "GC/lztmre_aus_m200912201002_dp8a2.tif",
+            "GC/lztmre_aus_m202606202608_dp8a2_vinterim.tif",
+        ]
+        assert manifest["shards"][1] == ["GC/lztmre_aus_m201003201005_dp8a2.tif"]
+        assert shard_bytes == [26_000_000_000, 13_000_000_000]
+
+        cmd_single = submit_batch_jobs.build_worker_command(
+            "s3://cibo-dat-oregon/DRCM/_batch_scripts/v4", explicit_shard_index=6
+        )
+        assert "--shard-index 6" in cmd_single[2]
+        assert "--shard-index" not in submit_batch_jobs.build_worker_command("s3://cibo-dat-oregon/DRCM/_batch_scripts/v4")[2]
+
+        env_map = {e["name"]: e["value"] for e in submit_batch_jobs.build_batch_environment()}
+        assert env_map["NUMBA_CPU_NAME"] == "generic" and env_map["NUMBA_CPU_FEATURES"] == "+neon"
+        assert "0" in env_map["GDAL_HTTP_RETRY_CODES"].split(",")
+
+        # 3. Verify --save upload + local file cleanup & -o s3:// upload with mocked boto3
         gt = (0.0, 30.0, 0.0, 0.0, 0.0, -30.0)
         bare1 = np.full((128, 128), 30, dtype=np.uint8)
         bare2 = np.full((128, 128), 60, dtype=np.uint8)
         ref = np.full((128, 128), 80, dtype=np.uint8)
+        bare2[:10, :10] = 255
+        bare2[30:40, 30:40] = 10  # Higher groundcover patch for non-constant output
 
         in1 = os.path.join(tmpdir, "lztmre_aus_m202503202505_dp8a2.tif")
         in2 = os.path.join(tmpdir, "lztmre_aus_m202506202508_dp8a2.tif")
@@ -609,6 +807,41 @@ def test_11_batch_worker_and_submission():
         _write_test_geotiff(in2, [bare2], gt, "", nodata=255, predictor=1, block_size=128)
         _write_test_geotiff(ref_tif, [ref], gt, "", nodata=0, predictor=1, block_size=128)
 
+        saved_copies = {}
+
+        class _FakeBotoS3:
+            def upload_file(self, Filename, Bucket, Key, Config=None):
+                dst = os.path.join(tmpdir, f"captured_{len(saved_copies)}.tif")
+                with open(Filename, "rb") as src, open(dst, "wb") as out:
+                    out.write(src.read())
+                saved_copies[(Bucket, Key)] = dst
+
+        fake_boto = types.ModuleType("boto3")
+        fake_boto.client = lambda svc: _FakeBotoS3()
+        fake_s3_pkg = types.ModuleType("boto3.s3")
+        fake_xfer = types.ModuleType("boto3.s3.transfer")
+        fake_xfer.TransferConfig = lambda **kw: kw
+        orig_mods = {k: sys.modules.get(k) for k in ("boto3", "boto3.s3", "boto3.s3.transfer")}
+        sys.modules["boto3"] = fake_boto
+        sys.modules["boto3.s3"] = fake_s3_pkg
+        sys.modules["boto3.s3.transfer"] = fake_xfer
+        try:
+            save_local = os.path.join(tmpdir, "save_target_doda2.tif")
+            ret_uri = run_seasonal_drcm_ibra(
+                in2, ref_tif, output_file=save_local, window=11, chunksize=128,
+                no_ibra=True, no_overviews=True, save=True,
+            )
+            assert ret_uri == "s3://cibo-dat-oregon/DRCM/save_target_doda2.tif"
+            assert not os.path.exists(save_local), "--save must delete local output after S3 upload"
+            assert ("cibo-dat-oregon", "DRCM/save_target_doda2.tif") in saved_copies
+        finally:
+            for k, v in orig_mods.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+        # 4. Run run_aus_batch_worker end-to-end and verify uploaded GeoTIFF pixel contents!
         manifest_path = os.path.join(tmpdir, "manifest.json")
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(
@@ -621,28 +854,31 @@ def test_11_batch_worker_and_submission():
                 f,
             )
 
-        class _FakeS3:
-            def __init__(self):
-                self.uploaded = {}
+        uploaded_bytes = {}
 
+        class _FakeWorkerS3:
             def head_object(self, Bucket, Key):
                 if Key.endswith("202503202505_doda2.tif"):
-                    return {"ContentLength": 500_000_000}  # Simulate already-completed Season 1
+                    return {"ContentLength": 500_000_000}
+                if Key in uploaded_bytes:
+                    return {"ContentLength": uploaded_bytes[Key][0]}
                 raise FileNotFoundError(Key)
 
             def upload_file(self, Filename, Bucket, Key, Config=None):
-                self.uploaded[Key] = os.path.getsize(Filename)
+                captured = os.path.join(tmpdir, os.path.basename(Key) + ".uploaded")
+                with open(Filename, "rb") as src, open(captured, "wb") as out:
+                    data = src.read()
+                    out.write(data)
+                uploaded_bytes[Key] = (len(data), captured)
 
-        fake_s3 = _FakeS3()
+        fake_s3 = _FakeWorkerS3()
         orig_build_s3 = run_aus_batch_worker._build_s3_client
         orig_cache_fn = run_aus_batch_worker._ensure_local_ref_cache
+        orig_run = seasonalDRCMIbra.run_seasonal_drcm_ibra
         orig_argv = sys.argv
         try:
             run_aus_batch_worker._build_s3_client = lambda: fake_s3
             run_aus_batch_worker._ensure_local_ref_cache = lambda s3, b, k, d: (ref_tif, False)
-
-            # Local inputs in manifest: override path resolution just for local paths
-            orig_run = seasonalDRCMIbra.run_seasonal_drcm_ibra
 
             def _wrapped_run(**kw):
                 ig = kw["input_groundcover"]
@@ -651,17 +887,7 @@ def test_11_batch_worker_and_submission():
                 return orig_run(**kw)
 
             seasonalDRCMIbra.run_seasonal_drcm_ibra = _wrapped_run
-            fake_s3_upload_target = "DRCM/aus/lztmre_aus_m202506202508_doda2.tif"
-
-            # Allow upload verification head_object to pass once uploaded
-            orig_head = fake_s3.head_object
-
-            def _head_after_upload(Bucket, Key):
-                if Key in fake_s3.uploaded:
-                    return {"ContentLength": fake_s3.uploaded[Key]}
-                return orig_head(Bucket, Key)
-
-            fake_s3.head_object = _head_after_upload
+            target_key = "DRCM/aus/lztmre_aus_m202506202508_doda2.tif"
             sys.argv = [
                 "run_aus_batch_worker.py",
                 "--manifest", manifest_path,
@@ -676,15 +902,69 @@ def test_11_batch_worker_and_submission():
             ]
             run_aus_batch_worker.main()
 
-            # Season 1 was skipped, Season 2 was computed & uploaded
-            assert list(fake_s3.uploaded.keys()) == [fake_s3_upload_target]
-            assert fake_s3.uploaded[fake_s3_upload_target] > 100
+            assert list(uploaded_bytes.keys()) == [target_key]
+            captured_tif = uploaded_bytes[target_key][1]
+            ds_up = gdal.Open(captured_tif)
+            assert ds_up.RasterCount == 2 and "Unconstrained" in ds_up.GetRasterBand(1).GetDescription()
+            up_dgc = ds_up.GetRasterBand(1).ReadAsArray()
+            up_ref = ds_up.GetRasterBand(2).ReadAsArray()
+            ds_up = None
+
+            gc2 = convert_to_groundcover(bare2, 255)
+            oracle_w = _oracle_refpixel(ref.view(np.int8), gc2, None, window=11, minvalpercent=0.10)
+            exp_ref = np.where(oracle_w < 0, 0, 100 + oracle_w).astype(np.uint8)
+            exp_dgc = np.where((oracle_w < 0) | (gc2 == 0), 0, 100 + gc2 - oracle_w).astype(np.uint8)
+            assert np.array_equal(up_dgc, exp_dgc) and np.array_equal(up_ref, exp_ref)
         finally:
             sys.argv = orig_argv
             run_aus_batch_worker._build_s3_client = orig_build_s3
             run_aus_batch_worker._ensure_local_ref_cache = orig_cache_fn
             seasonalDRCMIbra.run_seasonal_drcm_ibra = orig_run
-    print(">>> PASS: Batch submission manifest/command and worker skip-existing execution verified!")
+    print(">>> PASS: Batch submission, --save, and worker GeoTIFF output contents verified!")
+
+
+def test_12_remote_vsis3_and_chip_authenticity():
+    print("\n--- Test 12: Remote /vsis3/ Streaming & test_data/ Chip Authenticity Parity ---")
+    with tempfile.TemporaryDirectory(prefix="drcm_test12_") as tmpdir:
+        out_ibra = os.path.join(tmpdir, "s3_ibra.tif")
+        out_no_ibra = os.path.join(tmpdir, "s3_no_ibra.tif")
+        run_seasonal_drcm_ibra(
+            S3_GC_TIF, S3_REF_TIF, output_file=out_ibra,
+            window=101, test_chip=[90000, 80000, 440, 440],
+        )
+        run_seasonal_drcm_ibra(
+            S3_GC_TIF, S3_REF_TIF, output_file=out_no_ibra,
+            window=101, test_chip=[90000, 80000, 440, 440], no_ibra=True, no_overviews=True,
+        )
+
+        # Verify committed test_data/ chips match live S3 windows 100% bit-for-bit!
+        ds_s3_gc = gdal.Open(S3_GC_TIF)
+        ds_loc_gc = gdal.Open(LOCAL_GC_CHIP)
+        s3_gc = ds_s3_gc.GetRasterBand(1).ReadAsArray(90000, 80000, 440, 440)
+        loc_gc = ds_loc_gc.GetRasterBand(1).ReadAsArray()
+        assert np.array_equal(s3_gc, loc_gc), "test_data GC chip does not match S3 window!"
+
+        ds_s3_ref = gdal.Open(S3_REF_TIF)
+        ds_loc_ref = gdal.Open(LOCAL_REF_CHIP)
+        for b in (1, 2):
+            assert np.array_equal(
+                ds_s3_ref.GetRasterBand(b).ReadAsArray(89960, 79960, 520, 520),
+                ds_loc_ref.GetRasterBand(b).ReadAsArray(),
+            ), f"test_data ref band {b} does not match S3 window!"
+        ds_s3_gc = ds_loc_gc = ds_s3_ref = ds_loc_ref = None
+
+        # Verify remote /vsis3/ runs produce 0 mismatches against offline test_data/ runs
+        loc_ibra_out = os.path.join(tmpdir, "loc_ibra.tif")
+        loc_noibra_out = os.path.join(tmpdir, "loc_noibra.tif")
+        run_seasonal_drcm_ibra(LOCAL_GC_CHIP, LOCAL_REF_CHIP, output_file=loc_ibra_out, window=101)
+        run_seasonal_drcm_ibra(LOCAL_GC_CHIP, LOCAL_REF_CHIP, output_file=loc_noibra_out, window=101, no_ibra=True, no_overviews=True)
+
+        for s3_p, loc_p in ((out_ibra, loc_ibra_out), (out_no_ibra, loc_noibra_out)):
+            a, b = gdal.Open(s3_p), gdal.Open(loc_p)
+            assert np.array_equal(a.GetRasterBand(1).ReadAsArray(), b.GetRasterBand(1).ReadAsArray())
+            assert np.array_equal(a.GetRasterBand(2).ReadAsArray(), b.GetRasterBand(2).ReadAsArray())
+            a = b = None
+    print(">>> PASS: Remote /vsis3/ FastS3 streaming & test_data/ chip authenticity verified (0 mismatches)!")
 
 
 def main():
@@ -692,7 +972,7 @@ def main():
     parser.add_argument(
         "--offline",
         action="store_true",
-        help="Skip remote /vsis3/ tests (Tests 7 & 8) for local/CI verification without AWS access.",
+        help="Skip remote /vsis3/ streaming test (Test 12); still runs all local + test_data/ real satellite tests (Tests 1-11).",
     )
     args = parser.parse_args()
 
@@ -700,22 +980,26 @@ def main():
     test_1_utility_functions()
     test_2_groundcover_conversion()
     test_3_quantile_bounds_and_mean()
-    test_4_single_region_invariance_and_slicing()
+    test_4_oracle_invariance_and_slicing()
     test_5_boundary_isolation()
     test_6_ocean_and_valid_fraction()
-
-    if args.offline:
-        print("\n--- Tests 7 & 8: SKIPPED (--offline specified) ---")
-    else:
-        test_7_satellite_multi_ibra_end_to_end()
-        test_8_satellite_no_ibra_mode()
-
+    test_7_local_satellite_multi_ibra()
+    test_8_local_satellite_no_ibra_and_geojson()
     test_9_local_fast_tiled_reader_and_predictor_fallback()
     test_10_multichunk_and_halo_aoi_parity()
     test_11_batch_worker_and_submission()
 
+    if args.offline:
+        print("\n--- Test 12: SKIPPED (--offline specified) ---")
+    else:
+        test_12_remote_vsis3_and_chip_authenticity()
+
     t_total = time.perf_counter() - t0
-    ran_label = "9 OFFLINE TESTS" if args.offline else "ALL 11 CHEAT-PROOF TESTS (100% /vsis3/ + FastLocal + AOI + Batch)"
+    ran_label = (
+        "11 OFFLINE TESTS (incl. test_data/ real satellite chips)"
+        if args.offline
+        else "ALL 12 CHEAT-PROOF TESTS (incl. test_data/ + /vsis3/ parity)"
+    )
     print("\n========================================================")
     print(f"{ran_label} PASSED in {t_total:.2f}s!")
     print("========================================================")
