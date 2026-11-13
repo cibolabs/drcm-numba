@@ -324,7 +324,7 @@ def _configure_vsis3_defaults():
         "GDAL_HTTP_MULTIPLEX": "YES",
         "GDAL_HTTP_MAX_RETRY": "20",
         "GDAL_HTTP_RETRY_DELAY": "1",
-        "GDAL_HTTP_RETRY_CODES": "400,429,500,502,503,504,0",
+        "GDAL_HTTP_RETRY_CODES": "429,500,502,503,504,0",
         "CPL_ZIP_ENCODING": "UTF-8",
         "CPL_AWS_WEB_IDENTITY_ENABLE": "NO",
     }
@@ -566,6 +566,8 @@ class _SequentialBandReader:
     def __init__(self, in_path, ref_path, ibra_path=None, ibra_band_idx=None, io_workers=16):
         self.io_workers = max(1, int(io_workers))
         self.io_pool = None
+        self.coord_pool = None
+        self.band_pools = {}
         self.in_fast = None
         self.ref_fast = None
         self.ibra_fast = None
@@ -604,6 +606,18 @@ class _SequentialBandReader:
         )
         if s3_client is not None or has_local:
             self.io_pool = ThreadPoolExecutor(max_workers=self.io_workers)
+            n_bands = 3 if ibra_band_idx is not None else 2
+            if n_bands == 2:
+                per_band = max(4, min(16, self.io_workers // 2))
+            else:
+                per_band = 12 if self.io_workers >= 24 else max(4, (self.io_workers + 2) // 3)
+            self.coord_pool = ThreadPoolExecutor(max_workers=n_bands)
+            self.band_pools = {
+                "in": ThreadPoolExecutor(max_workers=per_band),
+                "ref": ThreadPoolExecutor(max_workers=per_band),
+            }
+            if ibra_band_idx is not None:
+                self.band_pools["ibra"] = ThreadPoolExecutor(max_workers=per_band)
 
             def _try_fast(path, ds, band_idx, sparse_fill):
                 if not path or not isinstance(path, str):
@@ -690,30 +704,72 @@ class _SequentialBandReader:
             print(f"boto3 unavailable for FastS3 reader, using GDAL: {exc}", flush=True)
             return None
 
+    def _read_in_one(self, in_win, pool):
+        if self.in_fast is not None:
+            return self.in_fast.read_window(in_win, pool)
+        return _read_gdal_band_with_retry(self.in_band, in_win)
+
+    def _read_ref_one(self, ref_win, pool):
+        if self.ref_fast is not None:
+            arr = self.ref_fast.read_window(ref_win, pool)
+        else:
+            arr = _read_gdal_band_with_retry(self.ref_band, ref_win)
+        return arr.view(np.int8) if arr.dtype == np.uint8 else arr.astype(np.int8)
+
+    def _read_ibra_one(self, ref_win, pool):
+        if self.ibra_fast is not None:
+            ib_arr = self.ibra_fast.read_window(ref_win, pool)
+        else:
+            ib_arr = _read_gdal_band_with_retry(self.ibra_band, ref_win)
+        return ib_arr if ib_arr.dtype == np.uint8 else ib_arr.astype(np.uint8)
+
     def read_in_window(self, in_win):
         """Read raw groundcover/bare input window."""
-        if self.in_fast is not None:
-            return self.in_fast.read_window(in_win, self.io_pool)
-        return _read_gdal_band_with_retry(self.in_band, in_win)
+        return self._read_in_one(in_win, self.io_pool)
 
     def read_ref_windows(self, ref_win, need_ibra=False):
         """Read reference percentile (and optional IBRA) window."""
-        if self.ref_fast is not None:
-            arr = self.ref_fast.read_window(ref_win, self.io_pool)
-        else:
-            arr = _read_gdal_band_with_retry(self.ref_band, ref_win)
-        perc = arr.view(np.int8) if arr.dtype == np.uint8 else arr.astype(np.int8)
-
-        ibra = None
-        if need_ibra:
-            if self.ibra_fast is not None:
-                ib_arr = self.ibra_fast.read_window(ref_win, self.io_pool)
-            else:
-                ib_arr = _read_gdal_band_with_retry(self.ibra_band, ref_win)
-            ibra = ib_arr if ib_arr.dtype == np.uint8 else ib_arr.astype(np.uint8)
+        perc = self._read_ref_one(ref_win, self.io_pool)
+        ibra = self._read_ibra_one(ref_win, self.io_pool) if need_ibra else None
         return perc, ibra
 
+    def read_all_windows(self, in_win, ref_win, need_ibra=False):
+        """Concurrently read input, reference, and optional IBRA windows when safe."""
+        if self.coord_pool is None:
+            bare = self.read_in_window(in_win)
+            perc, ibra = self.read_ref_windows(ref_win, need_ibra=need_ibra)
+            return bare, perc, ibra
+
+        f_in = self.coord_pool.submit(self._read_in_one, in_win, self.band_pools.get("in", self.io_pool))
+        can_split_ref_ibra = (
+            not need_ibra
+            or self.ref_fast is not None
+            or self.ibra_fast is not None
+            or self.ibra_ds is not None
+        )
+        if can_split_ref_ibra:
+            f_ref = self.coord_pool.submit(self._read_ref_one, ref_win, self.band_pools.get("ref", self.io_pool))
+            f_ib = (
+                self.coord_pool.submit(self._read_ibra_one, ref_win, self.band_pools.get("ibra", self.io_pool))
+                if need_ibra else None
+            )
+            bare = f_in.result()
+            perc = f_ref.result()
+            ibra = f_ib.result() if f_ib is not None else None
+            return bare, perc, ibra
+
+        f_pair = self.coord_pool.submit(self.read_ref_windows, ref_win, True)
+        bare = f_in.result()
+        perc, ibra = f_pair.result()
+        return bare, perc, ibra
+
     def close(self):
+        if self.coord_pool is not None:
+            self.coord_pool.shutdown(wait=True)
+            self.coord_pool = None
+        for p in self.band_pools.values():
+            p.shutdown(wait=True)
+        self.band_pools = {}
         if self.io_pool is not None:
             self.io_pool.shutdown(wait=True)
             self.io_pool = None
@@ -1035,8 +1091,8 @@ def run_seasonal_drcm_ibra(
         t0 = time.perf_counter()
         if read_h <= 0:
             return None, None, None, 0.0
-        bare = reader.read_in_window((in_read_x0, read_y_in, win_xsize, read_h))
-        perc_part, ibra_part = reader.read_ref_windows(
+        bare, perc_part, ibra_part = reader.read_all_windows(
+            (in_read_x0, read_y_in, win_xsize, read_h),
             (ref_read_x, read_y_ref, win_xsize, read_h),
             need_ibra=(not no_ibra),
         )
@@ -1149,10 +1205,10 @@ def run_seasonal_drcm_ibra(
                     upperquantile=upperquantile,
                     minvalpercent=minvalpercent,
                     r_start=y_slice_start,
-                    r_stop=y_slice_stop
+                    r_stop=y_slice_stop,
+                    c_start=x_slice_start,
+                    c_stop=x_slice_stop,
                 )
-                if pad_halo and (x_slice_start > 0 or x_slice_stop < win_xsize):
-                    chunk_ref = chunk_ref[:, x_slice_start:x_slice_stop]
             else:
                 chunk_ref = refpixelfilternodata(
                     percentile_data,

@@ -1,9 +1,10 @@
 """
 Numba-accelerated reference pixel filter without IBRA stratification.
 
-Uses a cache-tuned 2D tiled incremental column-histogram sliding window with
-L2-friendly uint16 column histograms, empty-block ocean skipping, aligned vector
-updates, and optional column slicing (c_start/c_stop) for halo-padded AOI runs.
+Uses a Serpentine 2D tiled incremental column-histogram sliding window with
+L2-friendly uint16 column histograms (int32 fallback for window > 65535),
+empty-block ocean skipping, aligned 104-bin vector updates, adaptive strip
+sizing, and optional column slicing (c_start/c_stop) for halo-padded AOI runs.
 """
 
 import numpy as np
@@ -89,6 +90,36 @@ def _tile_has_valid(blk, r0, r1, c0, c1, halfwindow, nrow, ncol, bsize):
 
 
 @njit(fastmath=False)
+def _tile_valid_row_range(blk, r0, r1, c0, c1, halfwindow, nrow, ncol, bsize):
+    """Return active row sub-range [act_r0, act_r1) within [r0, r1) whose halo contains valid paired pixels."""
+    wr0 = max(0, r0 - halfwindow)
+    wr1 = min(nrow, r1 + halfwindow)
+    wc0 = max(0, c0 - halfwindow)
+    wc1 = min(ncol, c1 + halfwindow)
+    br0 = wr0 // bsize
+    br1 = (wr1 - 1) // bsize
+    bc0 = wc0 // bsize
+    bc1 = (wc1 - 1) // bsize
+    first_br = br1 + 1
+    last_br = br0 - 1
+    for br in range(br0, br1 + 1):
+        for bc in range(bc0, bc1 + 1):
+            if blk[br, bc] != 0:
+                if br < first_br:
+                    first_br = br
+                if br > last_br:
+                    last_br = br
+                break
+    if first_br > last_br:
+        return r1, r0
+    act_r0 = max(r0, first_br * bsize - halfwindow)
+    act_r1 = min(r1, (last_br + 1) * bsize + halfwindow)
+    if act_r0 >= act_r1:
+        return r1, r0
+    return act_r0, act_r1
+
+
+@njit(fastmath=False)
 def _fill_empty_tile(out, r0, r1, c0, c1, r_start, c_start, halfwindow, nrow, ncol):
     """Fill an all-empty tile preserving boundary edge zero-npixel behavior."""
     for r in range(r0, r1):
@@ -157,112 +188,190 @@ def _make_kernel(col_hist_dtype):
         dryhist = np.zeros(104, dtype=np.int32)
         drysum = np.zeros(104, dtype=np.int32)
 
+        perc_tot = 0
+        validpixels = 0
+        act_c0 = max(0, c0 - halfwindow)
+        act_c1 = min(ncol, c0 + halfwindow + 1)
+        for cc in range(act_c0, act_c1):
+            tc = cc - w_c0
+            pt = col_perc_tot[tc]
+            if pt > 0:
+                perc_tot += pt
+                vt = col_valid_tot[tc]
+                if vt > 0:
+                    validpixels += vt
+                    for b in range(104):
+                        percentilehist[b] += np.int32(col_perc[tc, b])
+                        dryhist[b] += np.int32(col_dryhist[tc, b])
+                        drysum[b] += col_drysum[tc, b]
+                else:
+                    for b in range(104):
+                        percentilehist[b] += np.int32(col_perc[tc, b])
+
+        # Serpentine row sweep preserves the active 2D histogram at row turnarounds,
+        # eliminating per-row column histogram clearing and re-summation.
+        forward = True
         for r in range(r0, r1):
             if r > r0:
+                if forward:
+                    act_c0 = max(0, c0 - halfwindow)
+                    act_c1 = min(ncol, c0 + halfwindow + 1)
+                else:
+                    c_end = c1 - 1
+                    act_c0 = max(0, c_end - halfwindow)
+                    act_c1 = min(ncol, c_end + halfwindow + 1)
+
                 rem_r = r - 1 - halfwindow
                 if rem_r >= 0:
                     for cc in range(w_c0, w_c1):
                         pv = cover[rem_r, cc]
                         if 0 < pv <= 101:
                             tc = cc - w_c0
+                            in_act = act_c0 <= cc < act_c1
                             col_perc[tc, pv] -= one
                             col_perc_tot[tc] -= 1
+                            if in_act:
+                                perc_tot -= 1
+                                percentilehist[pv] -= 1
                             dv = ground[rem_r, cc]
                             if dv > 0:
                                 col_dryhist[tc, pv] -= one
                                 col_drysum[tc, pv] -= dv
                                 col_valid_tot[tc] -= 1
+                                if in_act:
+                                    validpixels -= 1
+                                    dryhist[pv] -= 1
+                                    drysum[pv] -= dv
+
                 add_r = r + halfwindow
                 if add_r < nrow:
                     for cc in range(w_c0, w_c1):
                         pv = cover[add_r, cc]
                         if 0 < pv <= 101:
                             tc = cc - w_c0
+                            in_act = act_c0 <= cc < act_c1
                             col_perc[tc, pv] += one
                             col_perc_tot[tc] += 1
+                            if in_act:
+                                perc_tot += 1
+                                percentilehist[pv] += 1
                             dv = ground[add_r, cc]
                             if dv > 0:
                                 col_dryhist[tc, pv] += one
                                 col_drysum[tc, pv] += dv
                                 col_valid_tot[tc] += 1
-
-            for b in range(104):
-                percentilehist[b] = 0
-                dryhist[b] = 0
-                drysum[b] = 0
-            perc_tot = 0
-            validpixels = 0
-
-            pre_end = min(ncol, c0 + halfwindow)
-            for cc in range(w_c0, pre_end):
-                tc = cc - w_c0
-                pt = col_perc_tot[tc]
-                if pt > 0:
-                    perc_tot += pt
-                    vt = col_valid_tot[tc]
-                    if vt > 0:
-                        validpixels += vt
-                        for b in range(104):
-                            percentilehist[b] += np.int32(col_perc[tc, b])
-                            dryhist[b] += np.int32(col_dryhist[tc, b])
-                            drysum[b] += col_drysum[tc, b]
-                    else:
-                        for b in range(104):
-                            percentilehist[b] += np.int32(col_perc[tc, b])
+                                if in_act:
+                                    validpixels += 1
+                                    dryhist[pv] += 1
+                                    drysum[pv] += dv
 
             topindex_f = max(1, (r + 1) - halfwindow)
             bottomindex_f = min(nrow, (r + 1) + halfwindow)
+            row_span = bottomindex_f - topindex_f
             out_r = r - r_start
 
-            for c in range(c0, c1):
-                j_f = c + 1
-                rightindex_f = j_f + halfwindow
-                right_c = rightindex_f - 1
-                if right_c < ncol:
-                    tc = right_c - w_c0
-                    pt = col_perc_tot[tc]
-                    if pt > 0:
-                        perc_tot += pt
-                        vt = col_valid_tot[tc]
-                        if vt > 0:
-                            validpixels += vt
-                            for b in range(104):
-                                percentilehist[b] += np.int32(col_perc[tc, b])
-                                dryhist[b] += np.int32(col_dryhist[tc, b])
-                                drysum[b] += col_drysum[tc, b]
-                        else:
-                            for b in range(104):
-                                percentilehist[b] += np.int32(col_perc[tc, b])
+            if forward:
+                for c in range(c0, c1):
+                    j_f = c + 1
+                    rightindex_f = j_f + halfwindow
+                    if j_f < halfwindow:
+                        npixels = row_span * rightindex_f
+                    elif rightindex_f > ncol:
+                        npixels = row_span * (ncol - j_f)
+                    else:
+                        npixels = row_span * window
 
-                if j_f < halfwindow:
-                    npixels = (bottomindex_f - topindex_f) * rightindex_f
-                elif rightindex_f > ncol:
-                    npixels = (bottomindex_f - topindex_f) * (ncol - j_f)
-                else:
-                    npixels = (bottomindex_f - topindex_f) * window
+                    if validpixels >= minpercentv_f32 * npixels:
+                        b0, b1 = _bounds_fast(percentilehist, perc_tot, 101, lowerq, upperq)
+                        out[out_r, c - c_start] = _calcmean(drysum, dryhist, b0, b1)
+                    else:
+                        out[out_r, c - c_start] = -1
 
-                if validpixels >= minpercentv_f32 * npixels:
-                    b0, b1 = _bounds_fast(percentilehist, perc_tot, 101, lowerq, upperq)
-                    out[out_r, c - c_start] = _calcmean(drysum, dryhist, b0, b1)
-                else:
-                    out[out_r, c - c_start] = -1
+                    if c + 1 < c1:
+                        left_c = c - halfwindow
+                        if left_c >= 0:
+                            tc = left_c - w_c0
+                            pt = col_perc_tot[tc]
+                            if pt > 0:
+                                perc_tot -= pt
+                                vt = col_valid_tot[tc]
+                                if vt > 0:
+                                    validpixels -= vt
+                                    for b in range(104):
+                                        percentilehist[b] -= np.int32(col_perc[tc, b])
+                                        dryhist[b] -= np.int32(col_dryhist[tc, b])
+                                        drysum[b] -= col_drysum[tc, b]
+                                else:
+                                    for b in range(104):
+                                        percentilehist[b] -= np.int32(col_perc[tc, b])
+                        next_right_c = (c + 1) + halfwindow
+                        if next_right_c < ncol:
+                            tc = next_right_c - w_c0
+                            pt = col_perc_tot[tc]
+                            if pt > 0:
+                                perc_tot += pt
+                                vt = col_valid_tot[tc]
+                                if vt > 0:
+                                    validpixels += vt
+                                    for b in range(104):
+                                        percentilehist[b] += np.int32(col_perc[tc, b])
+                                        dryhist[b] += np.int32(col_dryhist[tc, b])
+                                        drysum[b] += col_drysum[tc, b]
+                                else:
+                                    for b in range(104):
+                                        percentilehist[b] += np.int32(col_perc[tc, b])
+                forward = False
+            else:
+                for c in range(c1 - 1, c0 - 1, -1):
+                    j_f = c + 1
+                    rightindex_f = j_f + halfwindow
+                    if j_f < halfwindow:
+                        npixels = row_span * rightindex_f
+                    elif rightindex_f > ncol:
+                        npixels = row_span * (ncol - j_f)
+                    else:
+                        npixels = row_span * window
 
-                if j_f > halfwindow:
-                    left_c = (j_f - halfwindow) - 1
-                    tc = left_c - w_c0
-                    pt = col_perc_tot[tc]
-                    if pt > 0:
-                        perc_tot -= pt
-                        vt = col_valid_tot[tc]
-                        if vt > 0:
-                            validpixels -= vt
-                            for b in range(104):
-                                percentilehist[b] -= np.int32(col_perc[tc, b])
-                                dryhist[b] -= np.int32(col_dryhist[tc, b])
-                                drysum[b] -= col_drysum[tc, b]
-                        else:
-                            for b in range(104):
-                                percentilehist[b] -= np.int32(col_perc[tc, b])
+                    if validpixels >= minpercentv_f32 * npixels:
+                        b0, b1 = _bounds_fast(percentilehist, perc_tot, 101, lowerq, upperq)
+                        out[out_r, c - c_start] = _calcmean(drysum, dryhist, b0, b1)
+                    else:
+                        out[out_r, c - c_start] = -1
+
+                    if c > c0:
+                        right_c = c + halfwindow
+                        if right_c < ncol:
+                            tc = right_c - w_c0
+                            pt = col_perc_tot[tc]
+                            if pt > 0:
+                                perc_tot -= pt
+                                vt = col_valid_tot[tc]
+                                if vt > 0:
+                                    validpixels -= vt
+                                    for b in range(104):
+                                        percentilehist[b] -= np.int32(col_perc[tc, b])
+                                        dryhist[b] -= np.int32(col_dryhist[tc, b])
+                                        drysum[b] -= col_drysum[tc, b]
+                                else:
+                                    for b in range(104):
+                                        percentilehist[b] -= np.int32(col_perc[tc, b])
+                        prev_left_c = (c - 1) - halfwindow
+                        if prev_left_c >= 0:
+                            tc = prev_left_c - w_c0
+                            pt = col_perc_tot[tc]
+                            if pt > 0:
+                                perc_tot += pt
+                                vt = col_valid_tot[tc]
+                                if vt > 0:
+                                    validpixels += vt
+                                    for b in range(104):
+                                        percentilehist[b] += np.int32(col_perc[tc, b])
+                                        dryhist[b] += np.int32(col_dryhist[tc, b])
+                                        drysum[b] += col_drysum[tc, b]
+                                else:
+                                    for b in range(104):
+                                        percentilehist[b] += np.int32(col_perc[tc, b])
+                forward = True
 
     @njit(parallel=True, fastmath=False)
     def _run_tiled(
@@ -295,26 +404,38 @@ def _make_kernel(col_hist_dtype):
         else:
             blk = np.ones((1, 1), dtype=np.uint8)
 
-        n_row_strips = (n_out_r + strip_h - 1) // strip_h
+        eff_strip_h = strip_h
         n_col_tiles = (n_out_c + col_tile_w - 1) // col_tile_w
+        while eff_strip_h > 128 and ((n_out_r + eff_strip_h - 1) // eff_strip_h) * n_col_tiles < 256:
+            eff_strip_h //= 2
+
+        n_row_strips = (n_out_r + eff_strip_h - 1) // eff_strip_h
         n_tasks = n_row_strips * n_col_tiles
 
         for t in prange(n_tasks):
             rs = t // n_col_tiles
             ct = t % n_col_tiles
-            r0 = r_start + rs * strip_h
-            r1 = min(r_stop, r0 + strip_h)
+            r0 = r_start + rs * eff_strip_h
+            r1 = min(r_stop, r0 + eff_strip_h)
             c0 = c_start + ct * col_tile_w
             c1 = min(c_stop, c0 + col_tile_w)
-            if use_blk and not _tile_has_valid(blk, r0, r1, c0, c1, halfwindow, nrow, ncol, bsize):
-                _fill_empty_tile(out, r0, r1, c0, c1, r_start, c_start, halfwindow, nrow, ncol)
-                continue
+            if use_blk:
+                act_r0, act_r1 = _tile_valid_row_range(blk, r0, r1, c0, c1, halfwindow, nrow, ncol, bsize)
+                if act_r0 >= act_r1:
+                    _fill_empty_tile(out, r0, r1, c0, c1, r_start, c_start, halfwindow, nrow, ncol)
+                    continue
+                if act_r0 > r0:
+                    _fill_empty_tile(out, r0, act_r0, c0, c1, r_start, c_start, halfwindow, nrow, ncol)
+                if act_r1 < r1:
+                    _fill_empty_tile(out, act_r1, r1, c0, c1, r_start, c_start, halfwindow, nrow, ncol)
+            else:
+                act_r0, act_r1 = r0, r1
             _process_tile(
                 cover,
                 ground,
                 out,
-                r0,
-                r1,
+                act_r0,
+                act_r1,
                 c0,
                 c1,
                 r_start,
@@ -346,20 +467,24 @@ def refpixelfilternodata(
     r_stop=-1,
     c_start=0,
     c_stop=-1,
-    strip_h=256,
+    strip_h=16384,
     col_tile_w=512,
 ):
     """
     Numba-accelerated focal reference pixel filter over [r_start:r_stop, c_start:c_stop].
 
     Bit-for-bit compatible with the scalar sliding-window implementation while using
-    L2 cache-tuned uint16 column histograms and empty-block skipping.
+    a Serpentine 2D tiled L2 cache-tuned uint16 histogram sweep and empty-block skipping.
     """
     nrow, ncol = cover.shape
     r0 = max(0, int(r_start))
     c0 = max(0, int(c_start))
     r1 = nrow if r_stop < 0 or r_stop > nrow else int(r_stop)
     c1 = ncol if c_stop < 0 or c_stop > ncol else int(c_stop)
+    if r0 > r1:
+        r0 = r1
+    if c0 > c1:
+        c0 = c1
     kernel = _KERNEL_U16 if window <= 65535 else _KERNEL_I32
     return kernel(
         cover,

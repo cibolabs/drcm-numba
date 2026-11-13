@@ -83,7 +83,7 @@ def build_batch_environment(region=DEFAULT_REGION):
         {"name": "GDAL_HTTP_MULTIPLEX", "value": "YES"},
         {"name": "GDAL_HTTP_MAX_RETRY", "value": "20"},
         {"name": "GDAL_HTTP_RETRY_DELAY", "value": "1"},
-        {"name": "GDAL_HTTP_RETRY_CODES", "value": "400,429,500,502,503,504,0"},
+        {"name": "GDAL_HTTP_RETRY_CODES", "value": "429,500,502,503,504,0"},
         {"name": "GDAL_DISABLE_READDIR_ON_OPEN", "value": "EMPTY_DIR"},
         {"name": "CPL_VSIL_CURL_ALLOWED_EXTENSIONS", "value": ".tif,.TIF,.vrt,.geojson"},
         {"name": "CPL_ZIP_ENCODING", "value": "UTF-8"},

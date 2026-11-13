@@ -109,11 +109,11 @@ def _oracle_refpixel(
                     continue
                 vc = sub_cov[mask_reg]
                 vg = sub_gnd[mask_reg]
-                n_valid = int(np.sum((vc > 0) & (vg > 0)))
+                n_valid = int(np.sum((vc > 0) & (vc <= 101) & (vg > 0)))
                 if n_valid == 0 or n_valid < float(np.float32(minvalpercent)) * n_reg:
                     out[oi, oj] = -1
                     continue
-                pop_cov = vc[vc > 0]
+                pop_cov = vc[(vc > 0) & (vc <= 101)]
             else:
                 right_f = (c + 1) + hw
                 if (c + 1) < hw:
@@ -578,6 +578,14 @@ def test_9_local_fast_tiled_reader_and_predictor_fallback():
             got_ref, got_ib = rdr.read_ref_windows((0, 0, w, h), need_ibra=True)
             assert np.array_equal(got_ref, ref_arr.view(np.int8))
             assert np.array_equal(got_ib, ibra_arr)
+            # Concurrent coord_pool + per-band band_pools read_all_windows parity (with and without IBRA)
+            assert rdr.coord_pool is not None and set(rdr.band_pools.keys()) == {"in", "ref", "ibra"}
+            all_in, all_ref, all_ib = rdr.read_all_windows((0, 0, w, h), (0, 0, w, h), need_ibra=True)
+            assert np.array_equal(all_in, bare)
+            assert np.array_equal(all_ref, ref_arr.view(np.int8))
+            assert np.array_equal(all_ib, ibra_arr)
+            all_in2, all_ref2, all_ib2 = rdr.read_all_windows((0, 0, w, h), (0, 0, w, h), need_ibra=False)
+            assert np.array_equal(all_in2, bare) and np.array_equal(all_ref2, ref_arr.view(np.int8)) and all_ib2 is None
         finally:
             rdr.close()
 
@@ -590,6 +598,9 @@ def test_9_local_fast_tiled_reader_and_predictor_fallback():
             assert np.array_equal(rdr2.read_in_window((0, 0, w, h)), bare)
             got_ref2, got_ib2 = rdr2.read_ref_windows((0, 0, w, h), need_ibra=True)
             assert np.array_equal(got_ref2, ref_arr.view(np.int8)) and np.array_equal(got_ib2, ibra_arr)
+            # GDAL fallback serializes shared ref_ds (ref + ibra) while keeping input concurrent
+            fb_in, fb_ref, fb_ib = rdr2.read_all_windows((0, 0, w, h), (0, 0, w, h), need_ibra=True)
+            assert np.array_equal(fb_in, bare) and np.array_equal(fb_ref, ref_arr.view(np.int8)) and np.array_equal(fb_ib, ibra_arr)
         finally:
             rdr2.close()
 
@@ -923,8 +934,88 @@ def test_11_batch_worker_and_submission():
     print(">>> PASS: Batch submission, --save, and worker GeoTIFF output contents verified!")
 
 
-def test_12_remote_vsis3_and_chip_authenticity():
-    print("\n--- Test 12: Remote /vsis3/ Streaming & test_data/ Chip Authenticity Parity ---")
+def test_12_serpentine_kernels_and_edge_cases():
+    print("\n--- Test 12: Serpentine Kernels (strip_h=16384), 1..255 IBRA & Edge Cases vs Oracle ---")
+    rng = np.random.default_rng(20261113)
+
+    # 1. IBRA Serpentine: regions >= 90 (up to 255), k=1 vs k>=2 tight bboxes, cover=105 guard,
+    # native r_start/r_stop/c_start/c_stop halo slicing across col_tile_w boundaries, and U16/I32 parity.
+    H, W = 95, 135
+    cov = rng.integers(1, 102, size=(H, W), dtype=np.int16).astype(np.int8)
+    gnd = rng.integers(1, 102, size=(H, W), dtype=np.int16).astype(np.int8)
+    cov[rng.random((H, W)) < 0.18] = -1
+    gnd[rng.random((H, W)) < 0.12] = -1
+    cov[12:18, 22:28] = 105  # out-of-range > 101 must never overflow nbins=104 histogram
+    ibra = rng.choice([0, 17, 90, 145, 255], size=(H, W)).astype(np.uint8)
+    # Force one pure k=1 tile on left and multi-region k>=2 tile + partial ocean across col_tile_w=64
+    ibra[:, :64] = 200
+    ibra[:15, :64] = 0
+    ibra[-15:, :64] = 0
+
+    for sh, cw in ((16384, 64), (32, 48)):
+        got = refpix_numba_ibra.refpixelfilter_ibra(
+            cov, gnd, ibra, window=15, r_start=6, r_stop=87, c_start=11, c_stop=122,
+            strip_h=sh, col_tile_w=cw,
+        )
+        exp = _oracle_refpixel(
+            cov, gnd, ibra=ibra, window=15, r_slice=(6, 87), c_slice=(11, 122),
+        )
+        assert np.array_equal(got, exp), f"IBRA Serpentine mismatch for strip_h={sh}, col_tile_w={cw}"
+
+    got_i32 = refpix_numba_ibra._IBRA_KERNEL_I32(
+        cov, gnd, ibra, 15, 0.90, 0.95, 0.15, 6, 87, 11, 122, 16384, 64,
+    )
+    assert np.array_equal(got_i32, exp), "_IBRA_KERNEL_I32 vs oracle mismatch!"
+
+    # 2. --no-ibra Serpentine: cover=105 guard, ocean strip trimming, turnaround rows, and U16/I32 parity
+    cov_ni = rng.integers(1, 102, size=(120, 140), dtype=np.int16).astype(np.int8)
+    gnd_ni = rng.integers(1, 102, size=(120, 140), dtype=np.int16).astype(np.int8)
+    cov_ni[:20, :] = -1
+    cov_ni[-20:, :] = -1
+    cov_ni[35:45, 50:70] = 105
+    gnd_ni[rng.random((120, 140)) < 0.15] = -1
+
+    for sh, cw in ((16384, 64), (24, 48)):
+        got_ni = refpix_numba.refpixelfilternodata(
+            cov_ni, gnd_ni, window=17, r_start=10, r_stop=110, c_start=12, c_stop=128,
+            strip_h=sh, col_tile_w=cw,
+        )
+        exp_ni = _oracle_refpixel(
+            cov_ni, gnd_ni, ibra=None, window=17, r_slice=(10, 110), c_slice=(12, 128),
+        )
+        assert np.array_equal(got_ni, exp_ni), f"No-IBRA Serpentine mismatch for strip_h={sh}, col_tile_w={cw}"
+
+    # 3. Adversarial edge shapes & parameter guards for both kernels
+    edge_configs = [
+        ("window_1", (27, 31), 1, 0.15, 0, 27, 0, 31),
+        ("nrow_1", (1, 75), 11, 0.15, 0, 1, 4, 69),
+        ("ncol_lt_half", (38, 5), 21, 0.15, 3, 35, 0, 5),
+        ("minval_0", (31, 33), 9, 0.0, 2, 29, 2, 31),
+        ("empty_slice", (30, 30), 11, 0.15, 15, 15, 5, 25),
+    ]
+    for label, (eh, ew), win, mv, rs, rp, cs, cp in edge_configs:
+        ec = rng.integers(1, 102, size=(eh, ew), dtype=np.int16).astype(np.int8)
+        eg = rng.integers(1, 102, size=(eh, ew), dtype=np.int16).astype(np.int8)
+        ec[rng.random((eh, ew)) < 0.25] = -1
+        ei = rng.choice([0, 3, 210], size=(eh, ew)).astype(np.uint8)
+
+        g_no = refpix_numba.refpixelfilternodata(
+            ec, eg, window=win, minvalpercent=mv, r_start=rs, r_stop=rp, c_start=cs, c_stop=cp,
+        )
+        e_no = _oracle_refpixel(ec, eg, None, window=win, minvalpercent=mv, r_slice=(rs, rp), c_slice=(cs, cp))
+        assert np.array_equal(g_no, e_no), f"No-IBRA edge case {label} mismatch"
+
+        g_ib = refpix_numba_ibra.refpixelfilter_ibra(
+            ec, eg, ei, window=win, minvalpercent=mv, r_start=rs, r_stop=rp, c_start=cs, c_stop=cp,
+        )
+        e_ib = _oracle_refpixel(ec, eg, ei, window=win, minvalpercent=mv, r_slice=(rs, rp), c_slice=(cs, cp))
+        assert np.array_equal(g_ib, e_ib), f"IBRA edge case {label} mismatch"
+
+    print(">>> PASS: Serpentine IBRA (1..255, k=1/k>=2), No-IBRA (strip_h=16384), and all edge cases match oracle 100%!")
+
+
+def test_13_remote_vsis3_and_chip_authenticity():
+    print("\n--- Test 13: Remote /vsis3/ Streaming & test_data/ Chip Authenticity Parity ---")
     with tempfile.TemporaryDirectory(prefix="drcm_test12_") as tmpdir:
         out_ibra = os.path.join(tmpdir, "s3_ibra.tif")
         out_no_ibra = os.path.join(tmpdir, "s3_no_ibra.tif")
@@ -972,7 +1063,7 @@ def main():
     parser.add_argument(
         "--offline",
         action="store_true",
-        help="Skip remote /vsis3/ streaming test (Test 12); still runs all local + test_data/ real satellite tests (Tests 1-11).",
+        help="Skip remote /vsis3/ streaming test (Test 13); still runs all local + test_data/ real satellite tests (Tests 1-12).",
     )
     args = parser.parse_args()
 
@@ -988,17 +1079,18 @@ def main():
     test_9_local_fast_tiled_reader_and_predictor_fallback()
     test_10_multichunk_and_halo_aoi_parity()
     test_11_batch_worker_and_submission()
+    test_12_serpentine_kernels_and_edge_cases()
 
     if args.offline:
-        print("\n--- Test 12: SKIPPED (--offline specified) ---")
+        print("\n--- Test 13: SKIPPED (--offline specified) ---")
     else:
-        test_12_remote_vsis3_and_chip_authenticity()
+        test_13_remote_vsis3_and_chip_authenticity()
 
     t_total = time.perf_counter() - t0
     ran_label = (
-        "11 OFFLINE TESTS (incl. test_data/ real satellite chips)"
+        "12 OFFLINE TESTS (incl. test_data/ real satellite chips)"
         if args.offline
-        else "ALL 12 CHEAT-PROOF TESTS (incl. test_data/ + /vsis3/ parity)"
+        else "ALL 13 CHEAT-PROOF TESTS (incl. test_data/ + /vsis3/ parity)"
     )
     print("\n========================================================")
     print(f"{ran_label} PASSED in {t_total:.2f}s!")

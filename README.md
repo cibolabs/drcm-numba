@@ -101,21 +101,22 @@ woodyMaxMinCleared.tif  slope_relief_3s.tif   dixa2_bareStats.tif (Band 7)      
     ┌───────────────────────────────┴───────────────────────────────┐
     │                                                               │
     ▼ (AWS Batch Array / submit_batch_jobs.py)                      ▼ (FastS3 / FastLocal Tiled I/O)
-[run_aus_batch_worker.py (Shards 0..N-1)]            [Stage 2 Compute Kernels]
+[run_aus_batch_worker.py (Shards 0..N-1)]            [Stage 2 Compute Kernels (v5 Serpentine)]
  - Caches 3.8 GB reference COG once onto /tmp NVMe   - Default (--no-ibra): refpix_numba.py
- - Skips existing valid S3 outputs                     2D tiled (256x512) uint16 column histograms
- - Streams seasonal inputs via FastS3                  + 256x256 empty-block ocean skipping
+ - Skips existing valid S3 outputs                     Serpentine 2D tiled (16384x512) uint16 histograms
+ - Streams seasonal inputs via FastS3                  + 256x256 ocean block & row-range trimming
  - Overlaps S3 upload of season i with season i+1    - Stratified (--ibra): refpix_numba_ibra.py
-                                                       90x103 per-thread L2-cached histograms
+                                                       Serpentine 2D tiled (1..255 regions), k=1 fast path
+                                                       + k>=2 tight-bbox passes + 2-bit 256x256 skipping
     └───────────────────────────────┬───────────────────────────────┘
                                     │
                                     ▼
          ┌──────────────────────────────────────────────────────────┐
          │ Stage 3: seasonalDRCMIbra.py                             │
          │ - Auto-detects dp8a2 (0..100%) vs dixa2 (100..200)       │
-         │ - Reuses overlapping boundary halo chunks (no re-reads)  │
-         │ - Async next-chunk background prefetch + Numba LUT/encode│
-         │ - Halo-padded --bbox / --geojson AOI subsetting          │
+         │ - Concurrent multi-band read_all_windows (coord + band)  │
+         │ - Overlap halo reuse + next-chunk background prefetch    │
+         │ - Halo-padded --bbox / --geojson + native c_start/c_stop │
          │ - Internal DEFLATE overviews (4, 8, 16, 32) + S3 upload  │
          └──────────────────────────┬───────────────────────────────┘
                                     │
@@ -138,36 +139,44 @@ woodyMaxMinCleared.tif  slope_relief_3s.tif   dixa2_bareStats.tif (Band 7)      
 - **NCAS Woody Extent (`inputs.changeData[0] != 2`)**: Excludes forest canopy (`Class 2`) where canopy shadow and scattering confound understorey groundcover unmixing.
 - **Historical Clearing (`inputs.changeData[2] != 1`)**: Excludes cleared tracts so disturbed sites do not depress reference benchmarks.
 - **Terrain Slope Masking (`inputs.terrainData[0] < 39`)**: Retains plains, rises, and low hills (`< 10%` slope per Speight 2009 Table 5) while masking rolling/steep terrain (`>= 39`).
-- **IBRA Stratification vs. `--no-ibra` Operational Tradeoff**:
-  - Stratified mode (`--ibra` / default in `seasonalDRCMIbra.py`) constrains candidate reference pixels to the matching IBRA 7.0 region (`1..89`) to avoid cross-bioregion contamination across sharp landscape boundaries (e.g., floodplains next to dunefields).
-  - Unconstrained global mode (`--no-ibra`, operational default in `submit_batch_jobs.py` / `run_aus_batch_worker.py`) executes the **2D tiled column-histogram kernel** (`refpix_numba.py`), delivering continental runs in **~2–3 minutes per season**. *(Note: `refpix_numba_ibra.py` retains the 90-region L2-cached per-row kernel and has not yet been ported to 2D column-blocking/ocean-skipping.)*
+- **IBRA Stratification vs. `--no-ibra` Operational Mode**:
+  - Stratified mode (`--ibra`, default in `seasonalDRCMIbra.py`) constrains candidate reference pixels to the matching `uint8` IBRA 7.0 region (`1..255`, lifted from the legacy `< 90` cap) to avoid cross-bioregion contamination across sharp landscape boundaries (e.g., floodplains next to dunefields). With the `v5` Serpentine 2D tiled upgrade (`refpix_numba_ibra.py`), `--ibra` achieves **38×–77× faster** execution than the legacy per-row kernel and reaches virtual compute parity with `--no-ibra` (`10.76M px/s` vs `10.82M px/s` on a `16.0M px` continental-width chunk at 4 vCPUs).
+  - Unconstrained global mode (`--no-ibra`, operational default in `submit_batch_jobs.py` / `run_aus_batch_worker.py`) treats all unmasked pixels inside the moving window as a single pool (`refpix_numba.py`), upgraded to the `strip_h=16384` Serpentine kernel (**1.38×–1.45× faster** than `v4`).
 
 ---
 
-## 3. High-Performance Kernel & I/O Optimizations (`v1` → `v4`)
+## 3. High-Performance Kernel & I/O Optimizations (`v1` → `v5`)
 
-Cibo Labs upgraded the pipeline across four optimization generations while maintaining bit-for-bit agreement with the legacy baseline (`0` pixel mismatches verified across NSW AOI and continental Australia):
+Cibo Labs upgraded the pipeline across five optimization generations while maintaining bit-for-bit agreement with the legacy baseline (`0` pixel mismatches verified across NSW AOI, continental Australia, and the independent histogram-free test oracle):
 
-1. **2D Tiled Column Histograms & `uint16` Quantization (`refpix_numba.py`)**:
-   - Processes `strip_h=256 × col_tile_w=512` 2D tiles with column-major pre-aggregated histograms (`col_perc`, `col_dryhist`, `col_drysum`), slashing per-row inner-loop memory traffic.
-   - Automatically selects `uint16` histogram accumulators (`_KERNEL_U16`) whenever `window <= 65535` (halving L2 cache footprint relative to `int32`), with automatic `_KERNEL_I32` fallback for extreme windows (`window > 65535`).
+1. **2D Tiled Column Histograms & `uint16` Quantization (`v3`–`v4`, `refpix_numba.py`)**:
+   - Decomposes the sliding window into `col_tile_w=512` 2D tiles with column-major pre-aggregated histograms (`col_perc`, `col_dryhist`, `col_drysum`), slashing inner-loop memory traffic.
+   - Automatically selects `uint16` histogram accumulators (`_KERNEL_U16` / `_IBRA_KERNEL_U16`) whenever `window <= 65535` (halving L2 cache footprint relative to `int32`), with automatic `int32` fallback (`_KERNEL_I32` / `_IBRA_KERNEL_I32`) for extreme windows (`window > 65535`).
    - Pads histogram width to `104` bins for SIMD/cache-line alignment and uses branchless `_bounds_fast` with tracked non-zero totals (`perc_tot`).
-2. **Coarse `256 × 256` Empty-Block Ocean Skipping (`_build_valid_blocks`)**:
-   - Over half of the continental `141,481 × 135,159` bounding box is ocean or masked NoData.
-   - `_build_valid_blocks` builds a coarse `256 × 256` validity grid once per chunk; tiles whose window neighborhood contains zero valid pixels skip sliding-window construction entirely via `_fill_empty_tile`, preserving exact edge/interior semantics.
-3. **Direct Parallel Tile Readers: `FastS3` & `FastLocal` (`_FastS3TiledBandReader`)**:
-   - Inspects GeoTIFF TIFF IFD `TileOffsets` and `TileByteCounts` directly via `GDAL` metadata or local header parsing (`TIFF`/`BigTIFF` Classic & 64-bit).
-   - Verifies `COMPRESS=DEFLATE` + `PREDICTOR=1` on tile `(0, 0)` against GDAL before activating (automatically falling back to GDAL for `PREDICTOR=2` or unsupported layouts, as verified in Test 9).
-   - **`FastS3`**: Pooled `boto3` byte-range `GetObject` requests (`max_pool_connections = max(32, io_workers + 8)`) in a worker thread pool, bypassing GDAL `/vsis3/` curl lock contention.
-   - **`FastLocal`**: Lock-free positional reads via `os.pread` + `zlib.decompress` for NVMe-cached local GeoTIFFs (e.g., cached `3.8 GB` continental reference raster in `run_aus_batch_worker.py`).
-4. **Chunk Overlap Reuse, Prefetching, & Numba Encoding (`seasonalDRCMIbra.py`)**:
-   - Operational `--chunksize 16384` reuses the overlapping `2 × halfwindow` border rows from chunk `k` inside chunk `k+1` (zero redundant S3 border tile fetches).
-   - Overlaps background prefetch of chunk `k+1` (`_SequentialBandReader` / `ThreadPoolExecutor(max_workers=1)`) with Numba compute of chunk `k`.
-   - Uses a Numba LUT (`convert_to_groundcover(..., inplace=True)`) and parallel 2D encoder (`_encode_outputs_2d`) to eliminate intermediate full-chunk float/int32 allocations.
-5. **Container Quota Awareness, Halo-Padded AOIs, & S3 Upload**:
-   - `_get_effective_cpus()` reads Linux cgroup v2 (`cpu.max`) / cgroup v1 CFS CPU quotas so Numba/I/O thread pools size accurately inside AWS Batch containers without host core oversubscription.
-   - `--bbox` and `--geojson` (reprojected automatically via OGR) align precisely to the reference grid with full `halfwindow` halo read padding so AOI edge pixels match continental runs 100% bit-for-bit.
-   - `-o s3://bucket/prefix/` (or `s3://bucket/key.tif`) streams finished outputs straight to S3; `--save` retains backward compatibility by uploading to `s3://cibo-dat-oregon/DRCM/`.
+2. **The Serpentine Kernel & Adaptive `strip_h=16384` Tiling (`v5`, `refpix_numba.py` & `refpix_numba_ibra.py`)**:
+   - **Why standard row-by-row tiling stalled**: In earlier 2D tiled kernels (`v4`), every row inside a tile swept left-to-right (`c0 → c1 - 1`). Stepping down from `(r, c1 - 1)` back to `(r + 1, c0)` jumped `~512` pixels back to the left edge, forcing the kernel to **zero out the active 104-bin histograms and re-sum all `window` (`1,501`) vertical column histograms from scratch on every single row**.
+   - **How the Serpentine (boustrophedon) sweep works**:
+     ```
+     Row r   (even):  c0 ────────────────────────► c1-1   (slide window right)
+                                                     │     turnaround: only drop rem_r & add add_r
+     Row r+1 (odd):   c0 ◄──────────────────────── c1-1   (slide window left, zero rebuild!)
+     ```
+     Alternating left-to-right on even rows and right-to-left on odd rows keeps the `1,501`-column active histogram parked at the exact starting column for the next row. Vertical transitions only update one exiting row (`r - 1 - halfwindow`) and one entering row (`r + halfwindow`), completely eliminating per-row `1,501`-column histogram resets and re-summation.
+   - **Adaptive Strip Height (`strip_h=16384`)**: Raises the default strip height from `256` to `16384` so an entire operational chunk (`16,384` rows) runs as a single continuous Serpentine sweep per `512`-column tile—amortizing top-of-tile `window`-row setup by `64×`. On smaller grids or thin AOI slices, `eff_strip_h` automatically halves down toward `128` while `n_row_strips × n_col_tiles < 256` so CPU threads remain saturated.
+   - **Unified Multi-IBRA Serpentine Engine (`1..255` Regions)**: Replaces the legacy per-row `90 × 103` `int32` `--ibra` kernel (previously limited to region IDs `< 90`) with the full Serpentine 2D tiled `uint16`/`int32` engine:
+     * **2-bit `256 × 256` block mask (`_build_ibra_nonzero_blocks`)**: Bit `0` tracks `ibra > 0`; bit `1` tracks valid paired `(cover, ground)` pixels (`0 < pv <= 101` & `ground > 0`). `_tile_active_core_only` and `_tile_has_valid_halo` skip pure-ocean and halo-empty tiles without touching histograms.
+     * **Two-tier region specialization (`_scan_core_regions_2d`)**: Supports all `1..255` `uint8` IBRA bioregions. Interior single-region tiles (`k == 1`) execute a fast zero-branch Serpentine sweep (`only_write_matching=False`), while bioregion boundary tiles (`k >= 2`) run Serpentine passes restricted strictly to each active region's tight 2D bounding box `(reg_rmin..reg_rmax, reg_cmin..reg_cmax)`.
+     * **Native Halo Slicing**: Accepts `r_start`, `r_stop`, `c_start`, `c_stop` directly in both `--no-ibra` and `--ibra` kernels, eliminating post-compute Python array slicing on padded AOIs.
+     * **Leading & Trailing Ocean Row Trimming**: In `--no-ibra` mode, `_tile_valid_row_range` trims both top and bottom all-ocean segments per column tile via `_fill_empty_tile` before entering the Serpentine loop.
+3. **Coarse `256 × 256` Empty-Block Ocean Skipping (`_build_valid_blocks` / `_build_ibra_nonzero_blocks`)**:
+   - Over half of the continental `141,481 × 135,159` bounding box is ocean or masked NoData. Coarse `256 × 256` masks skip tiles with zero valid pixels inside their halo neighborhood while preserving exact edge/interior semantics.
+4. **Direct Parallel Tile Readers (`FastS3` & `FastLocal`) + Concurrent `read_all_windows` (`v5`)**:
+   - Inspects GeoTIFF TIFF IFD `TileOffsets` and `TileByteCounts` directly (`TIFF`/`BigTIFF` Classic & 64-bit) and verifies `COMPRESS=DEFLATE` + `PREDICTOR=1` on tile `(0, 0)` against GDAL before activating (automatically falling back to GDAL for `PREDICTOR=2` or unsupported layouts, as verified in Test 9).
+   - **`FastS3`** (`boto3` pooled byte-range `GetObject`s, `max_pool_connections=64`) and **`FastLocal`** (`os.pread` + `zlib.decompress`) eliminate GDAL `/vsis3/` lock contention.
+   - **Concurrent Multi-Band Tail Fetches (`read_all_windows`, `v5`)**: Replaces sequential `read_in_window()` → `read_ref_windows()` calls with a `2–3` thread `coord_pool` feeding dedicated per-band worker pools (`band_pools["in"]`, `"ref"`, `"ibra"`), fetching all input/reference/IBRA bands in parallel while keeping shared-dataset GDAL fallback reads serialized safely (`can_split_ref_ibra`).
+5. **Chunk Overlap Reuse, Prefetching, Numba Encoding, & Container Safeguards**:
+   - Operational `--chunksize 16384` reuses the overlapping `2 × halfwindow` border rows from chunk `k` inside chunk `k+1` and overlaps background prefetch (`ThreadPoolExecutor(max_workers=1)`) with Numba compute.
+   - Uses a Numba LUT (`convert_to_groundcover(..., inplace=True)`), parallel 2D encoder (`_encode_outputs_2d`), Linux cgroup v1/v2 quota detection (`_get_effective_cpus()`), halo-padded `--bbox`/`--geojson` alignment, and direct S3 `-o` / `--save` streaming.
 
 ---
 
@@ -213,8 +222,22 @@ Cibo Labs upgraded the pipeline across four optimization generations while maint
 | **Continental Australia (`m202603202605`, single)** | `c7g.16xlarge` (64 vCPU Spot, `FastS3`) | `141,481 × 135,159` (`19,122.4M px`) | **`164.72 s`** (`2m 44s`) | Avg `116.09M px/s`; `io_wait=12.1s`, `numba=93.8s`, `write=11.6s`, `ovr=38.9s`, `up=8.2s`, `max_rss=16,622.1 MB`, out `4,873.6 MB`; `0` mismatches vs `nsw_field` `v3`; est. Spot `$0.03664` (`$0.8008/hr`) |
 | **Multi-Season Worker (`m198912199002`, `FastLocal`)** | `r7g.16xlarge` (64 vCPU Spot, NVMe ref cache) | `141,481 × 135,159` (`17,372.4M px`) | **`110.23 s`** | Ref cache staged in `6.05s` (`3,801.0 MB`); avg `157.60M px/s` (`io_wait=11.6s`, `numba=51.6s`, `write=9.6s`, `ovr=37.3s`, `max_rss=16,374.8 MB`); overlapped S3 upload `1,975.3 MB` in `4.3s` |
 
-### B. Legacy Micro-Benchmarks (`maskChangeSteepIbra.py` & `refpix_numba_ibra.py`)
-- **`refpix_numba_ibra.py`** (`2000 × 2000`, `4,000,000 px`, `window=1501`, 8 cores): `5.80 s` (`689,599 px/s`, `2.13×` faster than `gfortran`/`f2py` at `12.38 s`).
+### B. Serpentine Kernel & Concurrent Multi-Band I/O Benchmarks (`v5` vs `v4`, Local 4-vCPU `AMD EPYC 9R14`)
+
+Directly measured apples-to-apples benchmarks (`NUMBA_NUM_THREADS=4`, `window=1501`, warm JIT, `0` pixel differences verified between `v4` (`354491b`) and `v5` Serpentine outputs):
+
+| Kernel / Reader Benchmark | Test Workload | `v4` (`354491b`) | `v5` Serpentine (`strip_h=16384`) | Speedup |
+| :--- | :--- | :--- | :--- | :--- |
+| **`--ibra` (`k=1` single-region)** | `3,000 × 2,000` input, `1,500 × 2,000` (`3.0M px`) core chunk | `9.811 s` (`0.31M px/s`) | **`0.259 s` (`11.60M px/s`)** | **`37.94×`** |
+| **`--ibra` (`4`-region boundary grid)** | `3,000 × 2,000` input, `3.0M px` core chunk (`k=1..4`) | `10.247 s` (`0.29M px/s`) | **`0.171 s` (`17.57M px/s`)** | **`60.01×`** |
+| **`--ibra` (`70%` ocean coastal)** | `3,000 × 2,000` input, `3.0M px` core chunk | `3.719 s` (`0.81M px/s`) | **`0.048 s` (`62.46M px/s`)** | **`77.42×`** |
+| **`--no-ibra` (dense land)** | `3,000 × 2,000` input, `3.0M px` core chunk | `0.339 s` (`8.84M px/s`) | **`0.234 s` (`12.82M px/s`)** | **`1.45×`** |
+| **`--no-ibra` (`70%` ocean coastal)** | `3,000 × 2,000` input, `3.0M px` core chunk | `0.108 s` (`27.70M px/s`) | **`0.079 s` (`38.19M px/s`)** | **`1.38×`** |
+| **Continental-width chunk (`--no-ibra` vs `--ibra`)** | `3,500 × 8,000` input, `2,000 × 8,000` (`16.0M px`, IBRA `17..255`) | — | `--no-ibra`: `1.479 s` (`10.82M px/s`)<br>`--ibra`: `1.487 s` (`10.76M px/s`) | **Virtual parity (`--ibra ≈ --no-ibra`)** |
+| **Multi-band S3 `FastS3` read (`read_all_windows`)** | Live `/vsis3/cibo-dat-oregon/` 3-band `4,096 × 2,048` (`io_workers=24`) | `0.164 s` (sequential) | **`0.100 s`** (concurrent `coord_pool` + `band_pools`) | **`1.65×`** |
+
+### C. Legacy Micro-Benchmarks (`maskChangeSteepIbra.py` & Pre-Serpentine `refpix_numba_ibra.py`)
+- **Original per-row `refpix_numba_ibra.py`** (`2000 × 2000`, `4,000,000 px`, `window=1501`, 8 cores): `5.80 s` (`689,599 px/s`, `2.13×` faster than `gfortran`/`f2py` at `12.38 s`; now superseded by Serpentine `v5` at `11.6–17.6M px/s` dense on just 4 cores).
 - **`maskChangeSteepIbra.py`**: Ocean fast-path skip + reusable in-memory `GDAL` dataset + single-pass OGR spatial filter reduced block time from `64.5 ms` to `30.2 ms` (`2.13×` faster).
 
 ---
@@ -226,7 +249,7 @@ The repository includes ~`495 KiB` of real Australian Albers (`EPSG:3577`) Lands
 - `test_data/lztmre_aus_m202606202608_dp8a2_vinterim.tif` (`440 × 440`, `338 KiB`) — seasonal bare cover chip nested at offset `(col=40, row=40)` inside the reference grid
 - `test_data/aoi_nsw_ibra_boundary.geojson` (`793 B`) — `EPSG:4326` polygon spanning the IBRA 17 / 58 boundary for offline halo-padded AOI verification
 
-The test suite provides **12 cheat-proof verification tests** supporting both full online `/vsis3/` testing (`python test_ibra_drcm.py`) and credential-free local/CI runs (`python test_ibra_drcm.py --offline`):
+The test suite provides **13 cheat-proof verification tests** supporting both full online `/vsis3/` testing (`python test_ibra_drcm.py`) and credential-free local/CI runs (`python test_ibra_drcm.py --offline`):
 
 | Test | Scope | Verified Properties |
 | :--- | :--- | :--- |
@@ -238,14 +261,15 @@ The test suite provides **12 cheat-proof verification tests** supporting both fu
 | **Test 6** | Ocean Masking, Empty-Block Skip & `minvalpercent` | `_build_valid_blocks` empty-block skip parity against unskipped kernel + oracle, ocean `0 → -1`, validity fraction thresholds |
 | **Test 7** | Portable Real Satellite Multi-IBRA *(offline + online)* | `test_data/` `440 × 440` chip offset `(40, 40)` inside `520 × 520` ref, `FastLocal` on all bands, `4` overviews, IBRA 17 vs 58 divergence, and `0`-mismatch parity vs `_oracle_refpixel` |
 | **Test 8** | Portable Real Satellite `--no-ibra` & `--geojson` *(offline + online)* | `test_data/` `--no-ibra` vs `_oracle_refpixel` + `EPSG:4326` `aoi_nsw_ibra_boundary.geojson` subsetting (`282 × 282`), `0` mismatches in `--no-ibra` and `--ibra` modes |
-| **Test 9** | `FastLocal` Multi-Band & GDAL Fallbacks | `INTERLEAVE=BAND` 2-band `FastLocal` activation and clean fallback to `GDAL` on `PREDICTOR=2` and `INTERLEAVE=PIXEL` inputs |
+| **Test 9** | `FastLocal` Multi-Band, Concurrent `read_all_windows` & Fallbacks | `INTERLEAVE=BAND` 2-band `FastLocal` activation, `coord_pool` + `band_pools` `read_all_windows` parity (with & without IBRA), and clean fallback to `GDAL` on `PREDICTOR=2` and `INTERLEAVE=PIXEL` inputs |
 | **Test 10** | Multi-Chunk Overlap, Spatial Offset & Strict AOI Bounds | Multi-chunk (`chunksize=96`) vs single-chunk identity; offset `(40, 35)` alignment; unpadded edge mismatch check proving halo necessity; strict `--bbox`/`--geojson` bounds & tight subset dimensions |
 | **Test 11** | Batch Submission, `--save` S3 Upload & Worker Content | `load_env_file`, round-robin shard contents, Graviton SVE/`GDAL` env, `--save` upload + local delete, and pixel-level verification of the GeoTIFF uploaded by `run_aus_batch_worker.py` |
-| **Test 12** | Remote `/vsis3/` & `test_data/` Authenticity *(online)* | Streams `FastS3` `/vsis3/cibo-dat-oregon/` COGs (`--ibra` and `--no-ibra`), proves `test_data/` chips match live S3 pixels 100% bit-for-bit, and verifies `0` output mismatches |
+| **Test 12** | Serpentine Kernels (`strip_h=16384`), `1..255` IBRA & Edge Cases *(offline + online)* | Serpentine IBRA (`reg=90..255`, `k=1` vs `k>=2` bboxes, `c_start`/`c_stop` halo slicing, `_IBRA_KERNEL_I32`), `--no-ibra` (`strip_h=16384` vs `24`, ocean trimming), `cover=105 > 101` bounds guard, `window=1`, `nrow=1`, `ncol<halfwindow`, `minvalpercent=0.0`, and empty slices vs `_oracle_refpixel` |
+| **Test 13** | Remote `/vsis3/` & `test_data/` Authenticity *(online)* | Streams `FastS3` `/vsis3/cibo-dat-oregon/` COGs (`--ibra` and `--no-ibra`), proves `test_data/` chips match live S3 pixels 100% bit-for-bit, and verifies `0` output mismatches |
 
 Latest verified results in the `rios` environment:
-- `python test_ibra_drcm.py --offline` (with AWS credential env vars unset): **11/11 offline tests passed in `24.14s`**.
-- `python test_ibra_drcm.py` (with AWS credentials in `us-west-2`): **All 12/12 tests passed in `29.52s`**.
+- `python test_ibra_drcm.py --offline` (with AWS credential env vars unset): **12/12 offline tests passed**.
+- `python test_ibra_drcm.py` (with AWS credentials in `us-west-2`): **All 13/13 tests passed** (see PR/CI run output).
 
 ---
 
@@ -255,13 +279,13 @@ Latest verified results in the `rios` environment:
 
 | Script | Role |
 | :--- | :--- |
-| `seasonalDRCMIbra.py` | Main pipeline driver: `FastS3`/`FastLocal` tiled readers, overlap reuse + prefetch, `--no-ibra` & `--ibra`, `--bbox`/`--geojson`, `-o s3://...` & `--save`, overviews, cgroup CPUs, `max_rss` telemetry |
-| `refpix_numba.py` | High-speed 2D tiled `uint16`/`int32` single-histogram Numba kernel with `256 × 256` empty-block ocean skipping (`--no-ibra` engine) |
-| `refpix_numba_ibra.py` | Multi-threaded Numba kernel maintaining 90 L2-cached IBRA regional histograms (`--ibra` engine) |
+| `seasonalDRCMIbra.py` | Main pipeline driver: `FastS3`/`FastLocal` tiled readers + concurrent `read_all_windows`, overlap reuse + prefetch, `--no-ibra` & `--ibra`, `--bbox`/`--geojson`, `-o s3://...` & `--save`, overviews, cgroup CPUs, `max_rss` telemetry |
+| `refpix_numba.py` | Serpentine 2D tiled `uint16`/`int32` (`strip_h=16384`) single-histogram Numba kernel with `256 × 256` empty-block ocean trimming and native `r_start/r_stop/c_start/c_stop` slicing (`--no-ibra` engine) |
+| `refpix_numba_ibra.py` | Serpentine 2D tiled `uint16`/`int32` (`strip_h=16384`) multi-IBRA Numba kernel supporting all `1..255` regions, `k=1`/`k>=2` tight-bbox passes, `256 × 256` 2-bit block skipping, and native `c_start`/`c_stop` slicing (`--ibra` engine) |
 | `run_aus_batch_worker.py` | AWS Batch array shard worker: local NVMe reference caching, `--skip-existing` S3 check, overlapped S3 uploads, explicit `--shard-index`/`--ibra-raster`/`--bbox`/`--geojson`/`--threads` |
 | `submit_batch_jobs.py` | AWS Batch orchestrator: S3 season discovery & `YYYYMM` filtering, round-robin sharding, S3 staging, Graviton SVE + GDAL env injection, `--smoke-test`, `--retry-shard`, `--wait`, `--watch-job-id`, `--dry-run` |
 | `maskChangeSteepIbra.py` | RIOS Stage 1 preprocessor generating 2-band NCAS/slope masked reference stats + IBRA raster |
-| `test_ibra_drcm.py` | 12-test cheat-proof verification suite (`--offline` using `test_data/` + full `/vsis3/` mode) |
+| `test_ibra_drcm.py` | 13-test cheat-proof verification suite (`--offline` using `test_data/` + full `/vsis3/` mode) |
 
 ### Common Operational Commands
 
@@ -342,9 +366,9 @@ conda run -n rios python maskChangeSteepIbra.py \
 #### 5. Run the Verification Suite (`test_ibra_drcm.py`)
 
 ```bash
-# Offline / CI mode (runs Tests 1-11 including portable test_data/ real satellite chips; zero AWS creds needed)
+# Offline / CI mode (runs Tests 1-12 including portable test_data/ real satellite chips; zero AWS creds needed)
 conda run -n rios python test_ibra_drcm.py --offline
 
-# Full 12-test suite including live /vsis3/cibo-dat-oregon streaming & chip authenticity parity
+# Full 13-test suite including live /vsis3/cibo-dat-oregon streaming & chip authenticity parity
 conda run -n rios python test_ibra_drcm.py
 ```
