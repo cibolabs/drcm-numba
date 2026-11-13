@@ -1,30 +1,31 @@
 """
 test_ibra_drcm.py
 
-Rigorous test suite for the Dynamic Reference Cover Method (DRCM) pipeline.
-Tests all core modules and kernels in this folder using remote /vsis3/ cloud datasets:
+Cheat-proof, rigorous test suite for the Dynamic Reference Cover Method (DRCM) pipeline.
+Covers core kernels, I/O engines, halo-padded AOI subsetting, chunk overlap reuse,
+AWS Batch manifest/worker orchestration, and remote /vsis3/ cloud datasets:
   - Reference: /vsis3/cibo-dat-oregon/DRCM/lztmre_aus_m198912202012_dixa2_change_slope_ibra.tif
-  - Ground Cover: /vsis3/cibo-dat-oregon/GC/lztmre_aus_m202606202608_dp8a2_vinterim.tif
+  - Fractional Cover: /vsis3/cibo-dat-oregon/GC/lztmre_aus_m202606202608_dp8a2_vinterim.tif
 
-  1. Utility Functions: format_time boundaries & derive_output_name with /vsis3/ paths
-  2. Groundcover Conversion: DEA dp8a2 & JRSRP dixa2 encodings + degenerate NoData checks
-  3. Quantile Bounds & Mean Kernel: _bounds & _calcmean analytical and degenerate edge cases
-  4. Single-Region Invariance: Bit-for-bit equivalence between refpix_numba_ibra and refpix_numba with NoData
-  5. Boundary Isolation: Zero cross-boundary leakage across boundary stripes & anti-identity checks
-  6. Ocean & Valid Fraction Thresholds: Ocean masking (ibra == 0 -> -1) & minvalpercent step-function
-  7. Real Satellite Multi-IBRA End-to-End Test: Full pipeline execution via /vsis3/, overview pyramids,
-     ecological separation between Regions 17 & 58, and bit-for-bit physical identity (DGC = 100 + gc - ref)
-  8. Single Global Histogram Mode Test: Full pipeline with --no-ibra via /vsis3/, 100% bit-for-bit match
-     against direct unconstrained baseline calculation
+Run full suite (including remote /vsis3/ tests 7 & 8):
+  python test_ibra_drcm.py
+
+Run offline/local suite only (e.g., CI or Docker builds without AWS credentials):
+  python test_ibra_drcm.py --offline
 """
 
+import argparse
+import json
 import os
 import sys
+import tempfile
 import time
+
 import numpy as np
-from osgeo import gdal
+from osgeo import gdal, ogr, osr
 
 gdal.UseExceptions()
+ogr.UseExceptions()
 
 # Ensure repository root is on sys.path and set as working directory
 REPO_ROOT = os.path.abspath(os.path.dirname(__file__))
@@ -34,10 +35,17 @@ os.chdir(REPO_ROOT)
 
 import refpix_numba
 import refpix_numba_ibra
+import run_aus_batch_worker
+import seasonalDRCMIbra
+import submit_batch_jobs
 from seasonalDRCMIbra import (
-    format_time,
-    derive_output_name,
+    _SequentialBandReader,
+    _parse_s3_uri,
+    _parse_vsis3_uri,
+    _to_gdal_path,
     convert_to_groundcover,
+    derive_output_name,
+    format_time,
     run_seasonal_drcm_ibra,
 )
 
@@ -47,8 +55,7 @@ S3_GC_TIF = "/vsis3/cibo-dat-oregon/GC/lztmre_aus_m202606202608_dp8a2_vinterim.t
 
 
 def test_1_utility_functions():
-    print("\n--- Test 1: Utility Functions (format_time, derive_output_name) ---")
-    # format_time boundary cases
+    print("\n--- Test 1: Utility & URI Functions (format_time, derive_output_name, S3 URIs) ---")
     assert format_time(0) == "0s"
     assert format_time(42) == "42s"
     assert format_time(59) == "59s"
@@ -57,122 +64,134 @@ def test_1_utility_functions():
     assert format_time(3599) == "59m 59s"
     assert format_time(3600) == "1h 00m 00s"
     assert format_time(3665) == "1h 01m 05s"
-    print("  format_time: PASSED (boundary seconds, minutes, hours verified)")
 
-    # derive_output_name with /vsis3/ paths (IBRA default)
-    out_dp8 = derive_output_name(S3_GC_TIF)
-    assert out_dp8 == "lztmre_aus_m202606202608_doda2_ibra_vinterim.tif", f"Unexpected output: {out_dp8}"
+    assert derive_output_name(S3_GC_TIF) == "lztmre_aus_m202606202608_doda2_ibra_vinterim.tif"
+    assert (
+        derive_output_name("/vsis3/cibo-dat-oregon/GC/lztmre_qld_m201609201611_dixa2_vinterim.tif")
+        == "lztmre_qld_m201609201611_doda2_ibra_vinterim.tif"
+    )
+    assert derive_output_name(S3_GC_TIF, no_ibra=True) == "lztmre_aus_m202606202608_doda2_vinterim.tif"
+    assert (
+        derive_output_name("/vsis3/cibo-dat-oregon/GC/lztmre_qld_m201609201611_dixa2_vinterim.tif", no_ibra=True)
+        == "lztmre_qld_m201609201611_doda2_vinterim.tif"
+    )
+    assert derive_output_name("custom_mosaic.tif") == "custom_mosaic_drcm_ibra.tif"
+    assert derive_output_name("custom_mosaic.tif", no_ibra=True) == "custom_mosaic_drcm.tif"
 
-    out_dix = derive_output_name("/vsis3/cibo-dat-oregon/GC/lztmre_qld_m201609201611_dixa2_vinterim.tif")
-    assert out_dix == "lztmre_qld_m201609201611_doda2_ibra_vinterim.tif", f"Unexpected output: {out_dix}"
+    assert _to_gdal_path("s3://cibo-dat-oregon/GC/test.tif") == "/vsis3/cibo-dat-oregon/GC/test.tif"
+    assert _to_gdal_path("/tmp/local.tif") == "/tmp/local.tif"
+    assert _parse_s3_uri("s3://cibo-dat-oregon/DRCM/out.tif") == ("cibo-dat-oregon", "DRCM/out.tif")
+    assert _parse_vsis3_uri("/vsis3/cibo-dat-oregon/DRCM/out.tif") == ("cibo-dat-oregon", "DRCM/out.tif")
 
-    # derive_output_name with no_ibra=True
-    out_dp8_noibra = derive_output_name(S3_GC_TIF, no_ibra=True)
-    assert out_dp8_noibra == "lztmre_aus_m202606202608_doda2_vinterim.tif", f"Unexpected output: {out_dp8_noibra}"
+    for bad in ("s3://cibo-dat-oregon/prefix/", "s3://only-bucket", "s3:///missing-bucket"):
+        raised = False
+        try:
+            _parse_s3_uri(bad)
+        except ValueError:
+            raised = True
+        assert raised, f"Expected ValueError for invalid S3 URI: {bad}"
 
-    out_dix_noibra = derive_output_name("/vsis3/cibo-dat-oregon/GC/lztmre_qld_m201609201611_dixa2_vinterim.tif", no_ibra=True)
-    assert out_dix_noibra == "lztmre_qld_m201609201611_doda2_vinterim.tif", f"Unexpected output: {out_dix_noibra}"
-
-    print("  derive_output_name: PASSED (/vsis3/ URI resolution for IBRA and no-IBRA)")
-    print(">>> PASS: Utility functions verified!")
+    print(">>> PASS: Utility and URI helpers verified!")
 
 
 def test_2_groundcover_conversion():
-    print("\n--- Test 2: Groundcover Encoding Conversion (convert_to_groundcover) ---")
-    # Modern DEA (dp8a2): Bare is 0..100%, 255 is NoData
-    # Mapping: bare=0 -> 101, bare=50 -> 51, bare=100 -> 1, bare=255 -> 0
+    print("\n--- Test 2: Groundcover Encoding Conversion (LUT, in-place, fallback, empty) ---")
     dea_bare = np.array([[0, 25, 50], [75, 100, 255]], dtype=np.uint8)
-    dea_gc = convert_to_groundcover(dea_bare, nodata_val=255)
     expected_dea = np.array([[101, 76, 51], [26, 1, 0]], dtype=np.int8)
-    assert np.array_equal(dea_gc, expected_dea), f"DEA conversion mismatch: {dea_gc} != {expected_dea}"
-    print("  Modern DEA (dp8a2): PASSED (unscaled 0..100% with 255 NoData)")
 
-    # Legacy JRSRP (dixa2): Bare is 100..200 (100 = 0% bare, 200 = 100% bare), 0 is NoData
-    # Mapping: bare=100 -> 101, bare=150 -> 51, bare=200 -> 1, bare=0 -> 0
+    dea_gc = convert_to_groundcover(dea_bare, nodata_val=255)
+    assert np.array_equal(dea_gc, expected_dea)
+
+    # In-place LUT path must share exact semantics and return int8 view
+    dea_copy = dea_bare.copy()
+    dea_inplace = convert_to_groundcover(dea_copy, nodata_val=255, inplace=True)
+    assert dea_inplace.dtype == np.int8 and np.array_equal(dea_inplace, expected_dea)
+    assert np.shares_memory(dea_copy, dea_inplace)
+
+    # Non-uint8 fallback path must match LUT output bit-for-bit
+    dea_u16 = convert_to_groundcover(dea_bare.astype(np.uint16), nodata_val=255)
+    assert np.array_equal(dea_u16, expected_dea)
+
+    # Legacy JRSRP (dixa2): 100..200 bare -> 101..1 gc, 0 -> 0
     jrsrp_bare = np.array([[100, 125, 150], [175, 200, 0]], dtype=np.uint8)
-    jrsrp_gc = convert_to_groundcover(jrsrp_bare, nodata_val=0)
     expected_jrsrp = np.array([[101, 76, 51], [26, 1, 0]], dtype=np.int8)
-    assert np.array_equal(jrsrp_gc, expected_jrsrp), f"JRSRP conversion mismatch: {jrsrp_gc} != {expected_jrsrp}"
-    print("  Legacy JRSRP (dixa2): PASSED (100-offset with 0 NoData)")
+    assert np.array_equal(convert_to_groundcover(jrsrp_bare, nodata_val=0), expected_jrsrp)
+    jrsrp_copy = jrsrp_bare.copy()
+    assert np.array_equal(convert_to_groundcover(jrsrp_copy, nodata_val=0, inplace=True), expected_jrsrp)
+    assert np.array_equal(convert_to_groundcover(jrsrp_bare.astype(np.uint16), nodata_val=0), expected_jrsrp)
 
-    # Degenerate: All-nodata array
-    all_nodata = np.full((10, 10), 255, dtype=np.uint8)
-    gc_nodata = convert_to_groundcover(all_nodata, nodata_val=255)
-    assert np.all(gc_nodata == 0), "All-nodata input must convert to all zeros"
-    print("  Degenerate NoData array: PASSED (all elements converted strictly to 0)")
-    print(">>> PASS: Groundcover auto-detection and conversion verified!")
+    # Degenerate: All-NoData and empty (0, 0)
+    assert np.all(convert_to_groundcover(np.full((10, 10), 255, dtype=np.uint8), nodata_val=255) == 0)
+    empty_gc = convert_to_groundcover(np.empty((0, 0), dtype=np.uint8), nodata_val=255, inplace=True)
+    assert empty_gc.shape == (0, 0) and empty_gc.dtype == np.int8
+    print(">>> PASS: Groundcover LUT, in-place, fallback, and edge cases verified!")
 
 
 def test_3_quantile_bounds_and_mean():
-    print("\n--- Test 3: Kernel Micro-Functions (_bounds, _calcmean) ---")
-    # Histogram with 10 items at bin 50 and 10 items at bin 80 (total = 20)
-    hist = np.zeros(103, dtype=np.int32)
+    print("\n--- Test 3: Kernel Micro-Functions (_bounds, _bounds_fast, _calcmean) ---")
+    hist = np.zeros(104, dtype=np.int32)
     hist[50] = 10
     hist[80] = 10
 
-    # 1. 90-95th percentile query:
-    b0_hi, b1_hi = refpix_numba_ibra._bounds(hist, 101, 0.90, 0.95)
-    assert b0_hi == 79 and b1_hi == 79, f"Expected (79, 79), got ({b0_hi}, {b1_hi})"
-    print(f"  _bounds (90-95th percentile): PASSED (strictly returned bounds b0={b0_hi}, b1={b1_hi})")
+    b0_hi, b1_hi = refpix_numba_ibra._bounds(hist[:103], 101, 0.90, 0.95)
+    b0_hi_f, b1_hi_f = refpix_numba._bounds_fast(hist, 20, 101, 0.90, 0.95)
+    assert (b0_hi, b1_hi) == (79, 79) and (b0_hi_f, b1_hi_f) == (79, 79)
 
-    # 2. 40-60th percentile query:
-    b0_mid, b1_mid = refpix_numba_ibra._bounds(hist, 101, 0.40, 0.60)
-    assert b0_mid == 49 and b1_mid == 79, f"Expected (49, 79), got ({b0_mid}, {b1_mid})"
-    print(f"  _bounds (40-60th percentile): PASSED (strictly returned bounds b0={b0_mid}, b1={b1_mid})")
+    b0_mid, b1_mid = refpix_numba_ibra._bounds(hist[:103], 101, 0.40, 0.60)
+    b0_mid_f, b1_mid_f = refpix_numba._bounds_fast(hist, 20, 101, 0.40, 0.60)
+    assert (b0_mid, b1_mid) == (49, 79) and (b0_mid_f, b1_mid_f) == (49, 79)
 
-    # 3. _calcmean test
     dryhist = np.zeros(103, dtype=np.int32)
     drysum = np.zeros(103, dtype=np.int32)
     dryhist[51] = 10
     drysum[51] = 700
-    mean_val = refpix_numba_ibra._calcmean(drysum, dryhist, 50, 50)
-    assert mean_val == 70, f"Expected mean 70, got {mean_val}"
-    print(f"  _calcmean: PASSED (computed mean {mean_val})")
+    assert refpix_numba_ibra._calcmean(drysum, dryhist, 50, 50) == 70
+    assert refpix_numba._calcmean(drysum, dryhist, 50, 50) == 70
 
-    # 4. Degenerate empty histogram tests
     dryhist.fill(0)
     drysum.fill(0)
-    mean_empty = refpix_numba_ibra._calcmean(drysum, dryhist, 10, 20)
-    assert mean_empty == 0, f"Expected 0 for empty histogram, got {mean_empty}"
-    b0_z, b1_z = refpix_numba_ibra._bounds(np.zeros(103, dtype=np.int32), 101, 0.90, 0.95)
-    assert b0_z == 0 and b1_z == 0, f"Expected (0, 0) for zero histogram, got ({b0_z}, {b1_z})"
-    print("  _calcmean and _bounds empty check: PASSED (safely returned 0 on empty input without divide-by-zero)")
-    print(">>> PASS: Low-level quantile and mean functions verified!")
+    assert refpix_numba_ibra._calcmean(drysum, dryhist, 10, 20) == 0
+    assert refpix_numba._calcmean(drysum, dryhist, 10, 20) == 0
+    assert refpix_numba_ibra._bounds(np.zeros(103, dtype=np.int32), 101, 0.90, 0.95) == (0, 0)
+    assert refpix_numba._bounds_fast(np.zeros(104, dtype=np.int32), 0, 101, 0.90, 0.95) == (0, 0)
+    print(">>> PASS: Quantile bounds and mean kernels verified across IBRA and Fast engines!")
 
 
-def test_4_single_region_invariance():
-    print("\n--- Test 4: Single-Region Invariance (refpix_numba_ibra vs refpix_numba) ---")
+def test_4_single_region_invariance_and_slicing():
+    print("\n--- Test 4: Single-Region Invariance, Tiled Slicing & Kernel Width Equivalence ---")
     np.random.seed(42)
     size = 200
     cover = np.random.randint(0, 102, size=(size, size), dtype=np.int8)
     ground = np.random.randint(0, 102, size=(size, size), dtype=np.int8)
-
-    # Inject structured NoData regions to exercise both valid and invalid pathways
     cover[:30, :30] = 0
     ground[:30, :30] = 0
     ibra = np.full((size, size), 17, dtype=np.uint8)
 
-    window = 31
-    lq = 0.90
-    uq = 0.95
-    minval = 0.15
+    window, lq, uq, minval = 31, 0.90, 0.95, 0.15
 
     res_global = refpix_numba.refpixelfilternodata(cover, ground, window, lq, uq, minval)
     res_ibra = refpix_numba_ibra.refpixelfilter_ibra(cover, ground, ibra, window, lq, uq, minval)
 
-    # Prove that non-trivial valid and nodata pixels exist
-    valid_count = np.sum(res_global > 0)
-    nodata_count = np.sum(res_global == -1)
-    assert valid_count > 10000, f"Expected >10,000 valid pixels, found {valid_count}"
-    assert nodata_count > 100, f"Expected >100 nodata pixels, found {nodata_count}"
-
-    # Strict bit-for-bit equivalence check
-    diff = np.abs(res_global.astype(int) - res_ibra.astype(int))
-    mismatches = np.sum(diff > 0)
-    assert mismatches == 0, f"Expected 0 mismatches within single IBRA region, found {mismatches}"
+    valid_count = int(np.sum(res_global > 0))
+    nodata_count = int(np.sum(res_global == -1))
+    assert valid_count > 10000 and nodata_count > 100
     assert np.array_equal(res_global, res_ibra), "res_global and res_ibra must be bit-for-bit identical"
-    print(f"  Evaluated {size * size:,} pixels ({valid_count:,} valid, {nodata_count:,} nodata): 0 mismatches vs global filter")
-    print(">>> PASS: IBRA-constrained filter is 100% bit-for-bit identical to global filter in single region!")
+
+    # Verify sub-window slicing (used by halo-padded AOIs and chunking) and alternate tile sizes
+    r0, r1, c0, c1 = 23, 173, 19, 181
+    sliced_small_tiles = refpix_numba.refpixelfilternodata(
+        cover, ground, window, lq, uq, minval,
+        r_start=r0, r_stop=r1, c_start=c0, c_stop=c1,
+        strip_h=32, col_tile_w=48,
+    )
+    assert np.array_equal(sliced_small_tiles, res_global[r0:r1, c0:c1]), "Sub-window or tile-size mismatch!"
+
+    # Verify int32 column-histogram kernel matches uint16 kernel bit-for-bit
+    res_i32 = refpix_numba._KERNEL_I32(
+        cover, ground, window, lq, uq, minval, 0, size, 0, size, 64, 64
+    )
+    assert np.array_equal(res_i32, res_global), "_KERNEL_I32 vs _KERNEL_U16 mismatch!"
+    print(f">>> PASS: {size * size:,} pixels, sub-window slicing, tile sizes, and U16/I32 kernels match 100%!")
 
 
 def test_5_boundary_isolation():
@@ -182,246 +201,524 @@ def test_5_boundary_isolation():
     ground = np.zeros((size, size), dtype=np.int8)
     ibra = np.zeros((size, size), dtype=np.uint8)
 
-    # Left half (Region 10): Majority cover=80, ground=70; 90th percentile peaks cover=95, ground=90
     cover[:, :50] = 80
     ground[:, :50] = 70
     ibra[:, :50] = 10
     cover[::6, :50] = 95
     ground[::6, :50] = 90
 
-    # Right half (Region 20): Majority cover=20, ground=15; 90th percentile peaks cover=35, ground=30
     cover[:, 50:] = 20
     ground[:, 50:] = 15
     ibra[:, 50:] = 20
     cover[::6, 50:] = 35
     ground[::6, 50:] = 30
 
-    window = 21  # window spans across boundary by +/- 10 pixels
-    lq = 0.90
-    uq = 0.95
-    minval = 0.05
-
+    window, lq, uq, minval = 21, 0.90, 0.95, 0.05
     res_ibra = refpix_numba_ibra.refpixelfilter_ibra(cover, ground, ibra, window, lq, uq, minval)
     res_global = refpix_numba.refpixelfilternodata(cover, ground, window, lq, uq, minval)
 
-    # 1. Anti-Identity Verification: Prove algorithm is NOT returning local ground
-    # At (55, 49): local ground is 70, but top 90th percentile in Region 10 is 90
     assert ground[55, 49] == 70 and res_ibra[55, 49] == 90
-    # At (55, 50): local ground is 15, but top 90th percentile in Region 20 is 30
     assert ground[55, 50] == 15 and res_ibra[55, 50] == 30
-
-    # 2. Boundary Stripe Verification: Entire boundary stripe must be isolated, not just a single pixel
-    # Region 10 adjacent to boundary (cols 48..49) across rows 20..80 must be 90
-    assert np.all(res_ibra[20:80, 48:50] == 90), "Region 10 boundary stripe contaminated by Region 20"
-    # Region 20 adjacent to boundary (cols 50..51) across rows 20..80 must be 30
-    assert np.all(res_ibra[20:80, 50:52] == 30), "Region 20 boundary stripe contaminated by Region 10"
-
-    # 3. Global Contamination Contrast: Unconstrained filter MUST contaminate across the boundary
-    # In Region 20 (cols 50..51), global filter is contaminated by Region 10 (>60)
-    assert np.all(res_global[20:80, 50:52] > 60), "Global filter must show severe cross-boundary contamination"
-
-    print("  Anti-identity check: PASSED (output differs strictly from local ground)")
-    print("  Boundary stripe isolation: PASSED (rows 20..80 cols 48..49=90, cols 50..51=30)")
-    print("  Global contrast: PASSED (unconstrained filter contaminated to >60 at boundary)")
-    print(">>> PASS: Zero cross-boundary contamination strictly proven (cheat-proof)!")
+    assert np.all(res_ibra[20:80, 48:50] == 90)
+    assert np.all(res_ibra[20:80, 50:52] == 30)
+    assert np.all(res_global[20:80, 50:52] > 60)
+    print(">>> PASS: Zero cross-boundary contamination strictly proven!")
 
 
 def test_6_ocean_and_valid_fraction():
-    print("\n--- Test 6: Ocean Masking & minvalpercent Threshold Enforcement ---")
+    print("\n--- Test 6: Ocean Masking, Empty-Block Skipping & minvalpercent Thresholds ---")
     size = 50
     cover = np.full((size, size), 60, dtype=np.int8)
     ground = np.full((size, size), 50, dtype=np.int8)
     ibra = np.full((size, size), 15, dtype=np.uint8)
 
-    # 1. Ocean test: top-left quadrant is ocean (ibra == 0)
     ibra[:25, :25] = 0
     res = refpix_numba_ibra.refpixelfilter_ibra(cover, ground, ibra, window=11)
-    ocean_vals = res[:25, :25]
-    land_vals = res[35:, 35:]
-    assert np.all(ocean_vals == -1), "All pixels with ibra == 0 must output -1 (NoData)"
-    assert np.all(land_vals == 50), "Valid land pixels should produce valid reference cover"
-    print(f"  Ocean masking: PASSED ({len(ocean_vals.flatten())} ibra==0 pixels strictly masked to -1)")
+    assert np.all(res[:25, :25] == -1)
+    assert np.all(res[35:, 35:] == 50)
 
-    # 2. minvalpercent threshold enforcement:
-    # Set exactly 30 valid pixels in a window of 121 pixels (fraction = 30/121 = 24.8%)
     cover.fill(0)
     ground.fill(0)
     ibra.fill(15)
-    cover[20:25, 20:26] = 60  # 5 * 6 = 30 valid pixels
+    cover[20:25, 20:26] = 60  # 30 / 121 = 24.8% valid
     ground[20:25, 20:26] = 50
 
-    # With minvalpercent=0.30: required = 36.3 > 30 -> must return -1
-    res_insufficient = refpix_numba_ibra.refpixelfilter_ibra(cover, ground, ibra, window=11, minvalpercent=0.30)
-    # With minvalpercent=0.15: required = 18.15 < 30 -> must return 50
-    res_sufficient = refpix_numba_ibra.refpixelfilter_ibra(cover, ground, ibra, window=11, minvalpercent=0.15)
+    res_insuff = refpix_numba_ibra.refpixelfilter_ibra(cover, ground, ibra, window=11, minvalpercent=0.30)
+    res_suff = refpix_numba_ibra.refpixelfilter_ibra(cover, ground, ibra, window=11, minvalpercent=0.15)
+    assert res_insuff[22, 22] == -1 and res_suff[22, 22] == 50
+    assert res_insuff[5, 5] == -1 and res_suff[5, 5] == -1
 
-    assert res_insufficient[22, 22] == -1, "Expected -1 when valid fraction is below threshold"
-    assert res_sufficient[22, 22] == 50, "Expected valid result when valid fraction meets threshold"
-    # Also check completely empty region
-    assert res_insufficient[5, 5] == -1 and res_sufficient[5, 5] == -1, "Empty regions must always return -1"
-    print("  minvalpercent threshold enforcement: PASSED (insufficient -> -1, sufficient -> 50)")
-    print(">>> PASS: NoData masking and validity thresholds verified!")
+    # Verify refpix_numba coarse 256x256 empty-block skipping preserves exact edge/interior semantics
+    sparse_h, sparse_w = 600, 600
+    sp_cov = np.zeros((sparse_h, sparse_w), dtype=np.int8)
+    sp_gnd = np.zeros((sparse_h, sparse_w), dtype=np.int8)
+    sp_cov[300:360, 300:360] = 72
+    sp_gnd[300:360, 300:360] = 64
+
+    blocks = refpix_numba._build_valid_blocks(sp_cov, sp_gnd, 256)
+    assert blocks[0, 0] == 0 and blocks[1, 1] == 1
+
+    # Compare empty-block-skipped run against unskipped run (forced via distant corner pixel)
+    sp_fast = refpix_numba.refpixelfilternodata(sp_cov, sp_gnd, window=31, minvalpercent=0.15)
+    sp_cov_unskipped = sp_cov.copy()
+    sp_cov_unskipped[0, 0] = 50
+    sp_gnd_unskipped = sp_gnd.copy()
+    sp_gnd_unskipped[0, 0] = 50
+    sp_unskipped = refpix_numba.refpixelfilternodata(
+        sp_cov_unskipped, sp_gnd_unskipped, window=31, minvalpercent=0.15
+    )
+    assert np.all(sp_fast[:250, :250] == -1)
+    assert np.all(sp_fast[:, -1] == 0)
+    assert np.array_equal(sp_fast[32:, :], sp_unskipped[32:, :])
+    assert np.array_equal(sp_fast[:, 32:], sp_unskipped[:, 32:])
+
+    # Verify parity with IBRA engine where minvalpercent (0.001 -> >=1 valid px) is invariant to 30*31 vs 31*31 denom
+    sp_fast_all = refpix_numba.refpixelfilternodata(sp_cov, sp_gnd, window=31, minvalpercent=0.001)
+    sp_ibra_all = refpix_numba_ibra.refpixelfilter_ibra(
+        sp_cov, sp_gnd, np.ones((sparse_h, sparse_w), dtype=np.uint8), window=31, minvalpercent=0.001
+    )
+    assert np.array_equal(sp_fast_all[:, :-1], sp_ibra_all[:, :-1])
+    print(">>> PASS: Ocean masking, empty-block skip, and validity thresholds verified!")
 
 
 def test_7_satellite_multi_ibra_end_to_end():
     print("\n--- Test 7: Real Satellite Multi-IBRA End-to-End Test (via /vsis3/) ---")
-    out_drcm_tif = "test_full_suite_drcm.tif"
-    if os.path.exists(out_drcm_tif):
-        os.remove(out_drcm_tif)
+    with tempfile.TemporaryDirectory(prefix="drcm_test7_") as tmpdir:
+        out_drcm_tif = os.path.join(tmpdir, "test_full_suite_drcm.tif")
+        run_seasonal_drcm_ibra(
+            input_groundcover=S3_GC_TIF,
+            percentile_file=S3_REF_TIF,
+            output_file=out_drcm_tif,
+            window=101,
+            test_chip=[90000, 80000, 500, 500],
+        )
 
-    # Execute seasonalDRCMIbra on test footprint spanning boundary (Regions 17 & 58) directly via /vsis3/
-    run_seasonal_drcm_ibra(
-        input_groundcover=S3_GC_TIF,
-        percentile_file=S3_REF_TIF,
-        output_file=out_drcm_tif,
-        window=101,
-        test_chip=[90000, 80000, 500, 500]
-    )
+        ds_res = gdal.Open(out_drcm_tif)
+        assert ds_res.RasterCount == 2
+        b1_res = ds_res.GetRasterBand(1)
+        b2_res = ds_res.GetRasterBand(2)
+        assert "IBRA-Constrained" in b1_res.GetDescription()
+        assert "IBRA-Constrained" in b2_res.GetDescription()
+        assert b1_res.GetOverviewCount() == 4
+        assert b2_res.GetOverviewCount() == 4
 
-    ds_res = gdal.Open(out_drcm_tif)
-    assert ds_res.RasterCount == 2, "Expected 2-band output from seasonalDRCMIbra"
-    b1_res = ds_res.GetRasterBand(1)
-    b2_res = ds_res.GetRasterBand(2)
+        dgc = b1_res.ReadAsArray()
+        ref_scaled = b2_res.ReadAsArray()
+        assert np.sum(dgc > 0) > 200000 and np.sum(ref_scaled > 0) > 200000
 
-    # 1. Verify descriptions
-    assert "IBRA-Constrained" in b1_res.GetDescription()
-    assert "IBRA-Constrained" in b2_res.GetDescription()
+        ds_ref = gdal.Open(S3_REF_TIF)
+        perc = ds_ref.GetRasterBand(1).ReadAsArray(90000, 80000, 500, 500).astype(np.int8)
+        ibra = ds_ref.GetRasterBand(2).ReadAsArray(90000, 80000, 500, 500)
+        ds_gc = gdal.Open(S3_GC_TIF)
+        bare = ds_gc.GetRasterBand(1).ReadAsArray(90000, 80000, 500, 500)
+        gc = convert_to_groundcover(bare)
 
-    # 2. Verify overview pyramids (levels 4, 8, 16, 32 = 4 overviews)
-    assert b1_res.GetOverviewCount() == 4, f"Expected 4 overviews for Band 1, got {b1_res.GetOverviewCount()}"
-    assert b2_res.GetOverviewCount() == 4, f"Expected 4 overviews for Band 2, got {b2_res.GetOverviewCount()}"
+        direct_ref = refpix_numba_ibra.refpixelfilter_ibra(perc, gc, ibra, window=101)
+        direct_ref_scaled = np.where(direct_ref < 0, 0, 100 + direct_ref).astype(np.uint8)
+        direct_dgc = np.where((direct_ref < 0) | (gc == 0), 0, 100 + gc - direct_ref).astype(np.uint8)
 
-    dgc = b1_res.ReadAsArray()
-    ref_scaled = b2_res.ReadAsArray()
+        assert np.array_equal(ref_scaled, direct_ref_scaled)
+        assert np.array_equal(dgc, direct_dgc)
 
-    valid_dgc_count = np.sum(dgc > 0)
-    valid_ref_count = np.sum(ref_scaled > 0)
-    print(f"  Output pixels: {valid_dgc_count:,} valid DGC, {valid_ref_count:,} valid Ref Cover")
-
-    assert valid_dgc_count > 200000, f"Expected >200k valid DGC pixels, found {valid_dgc_count}"
-    assert valid_ref_count > 200000, f"Expected >200k valid Ref pixels, found {valid_ref_count}"
-
-    # Read source arrays directly from S3 to verify against low-level mathematical kernel
-    ds_ref = gdal.Open(S3_REF_TIF)
-    perc = ds_ref.GetRasterBand(1).ReadAsArray(90000, 80000, 500, 500).astype(np.int8)
-    ibra = ds_ref.GetRasterBand(2).ReadAsArray(90000, 80000, 500, 500)
-
-    ds_gc = gdal.Open(S3_GC_TIF)
-    bare = ds_gc.GetRasterBand(1).ReadAsArray(90000, 80000, 500, 500)
-    gc = convert_to_groundcover(bare)
-
-    # 3. Direct Bit-for-Bit Kernel Verification
-    direct_ref = refpix_numba_ibra.refpixelfilter_ibra(perc, gc, ibra, window=101)
-    direct_ref_scaled = np.where(direct_ref < 0, 0, 100 + direct_ref).astype(np.uint8)
-    direct_dgc = np.where((direct_ref < 0) | (gc == 0), 0, 100 + gc - direct_ref).astype(np.uint8)
-
-    assert np.array_equal(ref_scaled, direct_ref_scaled), "Reference cover mismatch against direct kernel!"
-    assert np.array_equal(dgc, direct_dgc), "DGC mismatch against direct kernel!"
-    print("  Kernel bit-for-bit equivalence: PASSED (0 mismatches across all 250,000 pixels)")
-
-    # 4. Strict Physical Identity Verification (DGC = 100 + gc - ref)
-    valid_mask = (ref_scaled > 0) & (gc > 0)
-    expected_dgc = np.where(valid_mask, 200 + gc.astype(int) - ref_scaled.astype(int), 0).astype(np.uint8)
-    assert np.array_equal(dgc, expected_dgc), "DGC violates physical DRCM invariant: DGC = 100 + gc - ref"
-    print("  DRCM mathematical invariant: PASSED (DGC = 100 + gc - ref strictly satisfied everywhere)")
-
-    # 5. Ecological Separation between IBRA Regions
-    unique_regions = np.unique(ibra)
-    assert 17 in unique_regions and 58 in unique_regions, f"Expected regions 17 and 58, got {unique_regions}"
-
-    mask_reg17 = (ibra == 17) & (ref_scaled > 0)
-    mask_reg58 = (ibra == 58) & (ref_scaled > 0)
-    mean_ref_17 = np.mean(ref_scaled[mask_reg17])
-    mean_ref_58 = np.mean(ref_scaled[mask_reg58])
-    print(f"  Ecological Separation: Mean Ref Cover in Region 17={mean_ref_17:.2f}, Region 58={mean_ref_58:.2f}")
-    assert abs(mean_ref_17 - mean_ref_58) > 0.1, "Expected distinct reference cover across different IBRA regions"
-
-    # Range sanity check
-    assert np.all((dgc >= 0) & (dgc <= 201)), "DGC values out of byte range [0, 201]"
-    assert np.all((ref_scaled >= 0) & (ref_scaled <= 201)), "Reference cover values out of byte range [0, 201]"
-
-    ds_res = None
-    ds_ref = None
-    ds_gc = None
-
-    if os.path.exists(out_drcm_tif):
-        os.remove(out_drcm_tif)
-    print(">>> PASS: Real satellite multi-IBRA DRCM run (via /vsis3/) completed and validated!")
+        unique_regions = np.unique(ibra)
+        assert 17 in unique_regions and 58 in unique_regions
+        mean_17 = np.mean(ref_scaled[(ibra == 17) & (ref_scaled > 0)])
+        mean_58 = np.mean(ref_scaled[(ibra == 58) & (ref_scaled > 0)])
+        assert abs(mean_17 - mean_58) > 0.1
+        ds_res = ds_ref = ds_gc = None
+    print(">>> PASS: Real satellite multi-IBRA DRCM run (via /vsis3/) verified!")
 
 
 def test_8_satellite_no_ibra_mode():
     print("\n--- Test 8: Single Global Histogram Mode (--no-ibra via /vsis3/) ---")
-    out_no_ibra = "test_no_ibra_eval.tif"
-    if os.path.exists(out_no_ibra):
-        os.remove(out_no_ibra)
+    with tempfile.TemporaryDirectory(prefix="drcm_test8_") as tmpdir:
+        out_no_ibra = os.path.join(tmpdir, "test_no_ibra_eval.tif")
+        run_seasonal_drcm_ibra(
+            input_groundcover=S3_GC_TIF,
+            percentile_file=S3_REF_TIF,
+            output_file=out_no_ibra,
+            window=101,
+            test_chip=[90000, 80000, 500, 500],
+            no_ibra=True,
+            no_overviews=True,
+        )
 
-    # 1. Run seasonalDRCMIbra with no_ibra=True (single global histogram) directly via /vsis3/
-    run_seasonal_drcm_ibra(
-        input_groundcover=S3_GC_TIF,
-        percentile_file=S3_REF_TIF,
-        output_file=out_no_ibra,
-        window=101,
-        test_chip=[90000, 80000, 500, 500],
-        no_ibra=True,
-        no_overviews=True
+        ds1 = gdal.Open(out_no_ibra)
+        assert "Unconstrained" in ds1.GetRasterBand(1).GetDescription()
+        assert "Unconstrained" in ds1.GetRasterBand(2).GetDescription()
+        dgc1 = ds1.GetRasterBand(1).ReadAsArray()
+        ref1 = ds1.GetRasterBand(2).ReadAsArray()
+
+        in_ds = gdal.Open(S3_GC_TIF)
+        ref_ds = gdal.Open(S3_REF_TIF)
+        bare = in_ds.GetRasterBand(1).ReadAsArray(90000, 80000, 500, 500)
+        gc = convert_to_groundcover(bare)
+        perc = ref_ds.GetRasterBand(1).ReadAsArray(90000, 80000, 500, 500).astype(np.int8)
+
+        direct_ref = refpix_numba.refpixelfilternodata(perc, gc, window=101)
+        direct_ref_scaled = np.where(direct_ref < 0, 0, 100 + direct_ref).astype(np.uint8)
+        direct_dgc = np.where((direct_ref < 0) | (gc == 0), 0, 100 + gc - direct_ref).astype(np.uint8)
+
+        assert np.array_equal(dgc1, direct_dgc)
+        assert np.array_equal(ref1, direct_ref_scaled)
+        ds1 = in_ds = ref_ds = None
+    print(">>> PASS: --no-ibra unconstrained mode (via /vsis3/) matches baseline 100%!")
+
+
+def _write_test_geotiff(path, bands_u8, gt, proj_wkt, nodata=None, predictor=1, block_size=128):
+    """Helper to write a multi-band tiled DEFLATE uint8 GeoTIFF."""
+    h, w = bands_u8[0].shape
+    drv = gdal.GetDriverByName("GTiff")
+    opts = [
+        "COMPRESS=DEFLATE",
+        f"PREDICTOR={predictor}",
+        "TILED=YES",
+        f"BLOCKXSIZE={block_size}",
+        f"BLOCKYSIZE={block_size}",
+    ]
+    ds = drv.Create(path, w, h, len(bands_u8), gdal.GDT_Byte, options=opts)
+    ds.SetGeoTransform(gt)
+    if proj_wkt:
+        ds.SetProjection(proj_wkt)
+    for idx, arr in enumerate(bands_u8, start=1):
+        b = ds.GetRasterBand(idx)
+        if nodata is not None:
+            b.SetNoDataValue(nodata)
+        b.WriteArray(arr)
+    ds.FlushCache()
+    ds = None
+
+
+def test_9_local_fast_tiled_reader_and_predictor_fallback():
+    print("\n--- Test 9: FastLocal (os.pread + zlib) Tiled Reader & PREDICTOR=2 Fallback ---")
+    with tempfile.TemporaryDirectory(prefix="drcm_test9_") as tmpdir:
+        local_in = os.path.join(tmpdir, "in_pred1.tif")
+        local_pred2 = os.path.join(tmpdir, "in_pred2.tif")
+        local_ref = os.path.join(tmpdir, "ref.tif")
+        local_out = os.path.join(tmpdir, "out.tif")
+
+        rng = np.random.default_rng(12345)
+        h, w = 300, 300
+        bare = rng.integers(0, 101, size=(h, w), dtype=np.uint8)
+        bare[20:40, 20:40] = 255
+        ref_arr = rng.integers(1, 102, size=(h, w), dtype=np.uint8)
+        ref_arr[128:256, 128:256] = 0
+        gt = (0.0, 30.0, 0.0, 0.0, 0.0, -30.0)
+
+        _write_test_geotiff(local_in, [bare], gt, "", nodata=255, predictor=1, block_size=128)
+        _write_test_geotiff(local_pred2, [bare], gt, "", nodata=255, predictor=2, block_size=128)
+        _write_test_geotiff(local_ref, [ref_arr], gt, "", nodata=0, predictor=1, block_size=128)
+
+        # 1. Verify FastLocal activation and exact pixel reads
+        rdr = _SequentialBandReader(local_in, local_ref, io_workers=4)
+        try:
+            assert rdr.in_fast is not None and rdr.in_fast.local_path == local_in
+            assert rdr.ref_fast is not None and rdr.ref_fast.local_path == local_ref
+            assert np.array_equal(rdr.read_in_window((0, 0, w, h)), bare)
+            got_ref, _ = rdr.read_ref_windows((0, 0, w, h), need_ibra=False)
+            assert np.array_equal(got_ref, ref_arr.view(np.int8))
+        finally:
+            rdr.close()
+
+        # 2. Verify PREDICTOR=2 self-verification fallback cleanly drops back to GDAL
+        rdr2 = _SequentialBandReader(local_pred2, local_ref, io_workers=4)
+        try:
+            assert rdr2.in_fast is None, "PREDICTOR=2 input must safely fall back to GDAL reader"
+            assert rdr2.ref_fast is not None
+            assert np.array_equal(rdr2.read_in_window((0, 0, w, h)), bare)
+        finally:
+            rdr2.close()
+
+        # 3. Verify end-to-end local pipeline matches direct Numba kernel
+        run_seasonal_drcm_ibra(
+            input_groundcover=local_in,
+            percentile_file=local_ref,
+            output_file=local_out,
+            window=21,
+            chunksize=150,
+            no_ibra=True,
+            no_overviews=True,
+        )
+        ds_out = gdal.Open(local_out)
+        dgc = ds_out.GetRasterBand(1).ReadAsArray()
+        ref_scaled = ds_out.GetRasterBand(2).ReadAsArray()
+        ds_out = None
+
+        gc = convert_to_groundcover(bare, 255)
+        direct_ref = refpix_numba.refpixelfilternodata(ref_arr.view(np.int8), gc, window=21)
+        exp_ref = np.where(direct_ref < 0, 0, 100 + direct_ref).astype(np.uint8)
+        exp_dgc = np.where((direct_ref < 0) | (gc == 0), 0, 100 + gc - direct_ref).astype(np.uint8)
+        assert np.array_equal(dgc, exp_dgc) and np.array_equal(ref_scaled, exp_ref)
+    print(">>> PASS: FastLocal os.pread + PREDICTOR=2 GDAL fallback verified!")
+
+
+def test_10_multichunk_and_halo_aoi_parity():
+    print("\n--- Test 10: Multi-Chunk Overlap Reuse & Halo-Padded --bbox / --geojson Parity ---")
+    with tempfile.TemporaryDirectory(prefix="drcm_test10_") as tmpdir:
+        srs_3577 = osr.SpatialReference()
+        srs_3577.ImportFromEPSG(3577)
+        srs_3577.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        wkt_3577 = srs_3577.ExportToWkt()
+
+        srs_4326 = osr.SpatialReference()
+        srs_4326.ImportFromEPSG(4326)
+        srs_4326.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+
+        h, w = 420, 440
+        gt = (1000000.0, 30.0, 0.0, -3200000.0, 0.0, -30.0)
+        rng = np.random.default_rng(777)
+        bare = rng.integers(5, 95, size=(h, w), dtype=np.uint8)
+        bare[:40, :40] = 255
+        perc = rng.integers(10, 101, size=(h, w), dtype=np.uint8)
+        ibra = np.where(np.arange(w)[None, :] < 220, 17, 58).astype(np.uint8)
+
+        in_tif = os.path.join(tmpdir, "aus_synth_dp8a2.tif")
+        ref_tif = os.path.join(tmpdir, "aus_synth_ref_ibra.tif")
+        _write_test_geotiff(in_tif, [bare], gt, wkt_3577, nodata=255, predictor=1, block_size=128)
+        _write_test_geotiff(ref_tif, [perc, ibra], gt, wkt_3577, nodata=0, predictor=1, block_size=128)
+
+        # 1. Verify multi-chunk overlap reuse (chunksize=96 -> 5 chunks) vs single-chunk (chunksize=1024)
+        for no_ibra in (True, False):
+            tag = "noibra" if no_ibra else "ibra"
+            full_1 = os.path.join(tmpdir, f"full_single_{tag}.tif")
+            full_n = os.path.join(tmpdir, f"full_multi_{tag}.tif")
+            run_seasonal_drcm_ibra(
+                in_tif, ref_tif, output_file=full_1, window=31, chunksize=1024,
+                no_ibra=no_ibra, no_overviews=True,
+            )
+            run_seasonal_drcm_ibra(
+                in_tif, ref_tif, output_file=full_n, window=31, chunksize=96,
+                no_ibra=no_ibra, no_overviews=True,
+            )
+            d1 = gdal.Open(full_1)
+            dn = gdal.Open(full_n)
+            for b in (1, 2):
+                assert np.array_equal(d1.GetRasterBand(b).ReadAsArray(), dn.GetRasterBand(b).ReadAsArray())
+            d1 = dn = None
+
+        # 2. Verify halo-padded --bbox and EPSG:4326 --geojson match full-grid slice 100% bit-for-bit
+        # Choose AOI spanning columns 150..310 and rows 120..300 (crosses IBRA boundary at col 220!)
+        minx = gt[0] + 150 * gt[1]
+        maxx = gt[0] + 310 * gt[1]
+        maxy = gt[3] + 120 * gt[5]
+        miny = gt[3] + 300 * gt[5]
+
+        # Build EPSG:4326 GeoJSON polygon corresponding to exact projected envelope corners
+        to_4326 = osr.CoordinateTransformation(srs_3577, srs_4326)
+        ring_coords = []
+        for px, py in ((minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy), (minx, miny)):
+            lon, lat, _ = to_4326.TransformPoint(px, py)
+            ring_coords.append([lon, lat])
+        geojson_path = os.path.join(tmpdir, "aoi_4326.geojson")
+        with open(geojson_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "type": "FeatureCollection",
+                    "crs": {"type": "name", "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"}},
+                    "features": [
+                        {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [ring_coords]}}
+                    ],
+                },
+                f,
+            )
+
+        for no_ibra in (True, False):
+            tag = "noibra" if no_ibra else "ibra"
+            ref_full_ds = gdal.Open(os.path.join(tmpdir, f"full_single_{tag}.tif"))
+            full_b1 = ref_full_ds.GetRasterBand(1).ReadAsArray()
+            full_b2 = ref_full_ds.GetRasterBand(2).ReadAsArray()
+            ref_full_ds = None
+
+            out_bbox = os.path.join(tmpdir, f"bbox_{tag}.tif")
+            out_gj = os.path.join(tmpdir, f"gj_{tag}.tif")
+            run_seasonal_drcm_ibra(
+                in_tif, ref_tif, output_file=out_bbox, window=31, chunksize=80,
+                bbox=[minx, miny, maxx, maxy], no_ibra=no_ibra, no_overviews=True,
+            )
+            run_seasonal_drcm_ibra(
+                in_tif, ref_tif, output_file=out_gj, window=31, chunksize=80,
+                geojson=geojson_path, no_ibra=no_ibra, no_overviews=True,
+            )
+
+            for p in (out_bbox, out_gj):
+                sub_ds = gdal.Open(p)
+                sgt = sub_ds.GetGeoTransform()
+                x0 = int(round((sgt[0] - gt[0]) / gt[1]))
+                y0 = int(round((sgt[3] - gt[3]) / gt[5]))
+                sw, sh = sub_ds.RasterXSize, sub_ds.RasterYSize
+                assert np.array_equal(sub_ds.GetRasterBand(1).ReadAsArray(), full_b1[y0:y0 + sh, x0:x0 + sw]), (
+                    f"Band 1 halo mismatch for {p}"
+                )
+                assert np.array_equal(sub_ds.GetRasterBand(2).ReadAsArray(), full_b2[y0:y0 + sh, x0:x0 + sw]), (
+                    f"Band 2 halo mismatch for {p}"
+                )
+                sub_ds = None
+    print(">>> PASS: Multi-chunk overlap reuse & halo-padded --bbox/--geojson parity verified (0 mismatches)!")
+
+
+def test_11_batch_worker_and_submission():
+    print("\n--- Test 11: Batch Submission Manifest/Command & Worker Shard Execution ---")
+    # 1. Test season filtering, round-robin sharding, and command construction
+    sample_items = [
+        ("GC/lztmre_aus_m200909200911_dp8a2.tif", 10_000_000_000),
+        ("GC/lztmre_aus_m200912201002_dp8a2.tif", 12_000_000_000),
+        ("GC/lztmre_aus_m201003201005_dp8a2.tif", 13_000_000_000),
+        ("GC/lztmre_aus_m202606202608_dp8a2_vinterim.tif", 14_000_000_000),
+        ("GC/unrelated_file.tif", 1_000_000),
+    ]
+    filtered = submit_batch_jobs.filter_season_items(sample_items, start_ym="200912", end_ym="202608")
+    assert [k for k, _ in filtered] == [
+        "GC/lztmre_aus_m200912201002_dp8a2.tif",
+        "GC/lztmre_aus_m201003201005_dp8a2.tif",
+        "GC/lztmre_aus_m202606202608_dp8a2_vinterim.tif",
+    ]
+
+    manifest, shard_bytes = submit_batch_jobs.build_shard_manifest(
+        filtered, num_shards=2, geojson="field.geojson", output_prefix="DRCM/nsw_field"
     )
+    assert manifest["num_shards"] == 2
+    assert manifest["output_prefix"] == "DRCM/nsw_field/"
+    assert manifest["geojson"] == "field.geojson"
+    assert len(manifest["shards"][0]) == 2 and len(manifest["shards"][1]) == 1
+    assert sum(shard_bytes) == 39_000_000_000
 
-    ds1 = gdal.Open(out_no_ibra)
-    b1_desc = ds1.GetRasterBand(1).GetDescription()
-    b2_desc = ds1.GetRasterBand(2).GetDescription()
-    assert "Unconstrained" in b1_desc, f"Expected 'Unconstrained' in Band 1 description, got: {b1_desc}"
-    assert "Unconstrained" in b2_desc, f"Expected 'Unconstrained' in Band 2 description, got: {b2_desc}"
-    print(f"  Band descriptions verified: '{b1_desc}' & '{b2_desc}'")
+    # Single-shard / retry commands must pass explicit --shard-index
+    cmd_single = submit_batch_jobs.build_worker_command(
+        "s3://cibo-dat-oregon/DRCM/_batch_scripts/v4", explicit_shard_index=6
+    )
+    assert "--shard-index 6" in cmd_single[2]
+    cmd_array = submit_batch_jobs.build_worker_command("s3://cibo-dat-oregon/DRCM/_batch_scripts/v4")
+    assert "--shard-index" not in cmd_array[2]
 
-    dgc1 = ds1.GetRasterBand(1).ReadAsArray()
-    ref1 = ds1.GetRasterBand(2).ReadAsArray()
+    env_map = {e["name"]: e["value"] for e in submit_batch_jobs.build_batch_environment()}
+    assert env_map["NUMBA_CPU_NAME"] == "generic"
+    assert env_map["NUMBA_CPU_FEATURES"] == "+neon"
+    assert "0" in env_map["GDAL_HTTP_RETRY_CODES"].split(",")
 
-    # 2. Directly compute unconstrained reference and DGC on the exact same chip from /vsis3/
-    in_ds = gdal.Open(S3_GC_TIF)
-    ref_ds = gdal.Open(S3_REF_TIF)
-    bare = in_ds.GetRasterBand(1).ReadAsArray(90000, 80000, 500, 500)
-    gc = convert_to_groundcover(bare)
-    perc = ref_ds.GetRasterBand(1).ReadAsArray(90000, 80000, 500, 500).astype(np.int8)
+    # 2. Test run_aus_batch_worker manifest parsing, skip-existing, and shard execution locally
+    with tempfile.TemporaryDirectory(prefix="drcm_test11_") as tmpdir:
+        gt = (0.0, 30.0, 0.0, 0.0, 0.0, -30.0)
+        bare1 = np.full((128, 128), 30, dtype=np.uint8)
+        bare2 = np.full((128, 128), 60, dtype=np.uint8)
+        ref = np.full((128, 128), 80, dtype=np.uint8)
 
-    direct_ref = refpix_numba.refpixelfilternodata(perc, gc, window=101)
-    direct_ref_scaled = np.where(direct_ref < 0, 0, 100 + direct_ref).astype(np.uint8)
-    direct_dgc = np.where((direct_ref < 0) | (gc == 0), 0, 100 + gc - direct_ref).astype(np.uint8)
+        in1 = os.path.join(tmpdir, "lztmre_aus_m202503202505_dp8a2.tif")
+        in2 = os.path.join(tmpdir, "lztmre_aus_m202506202508_dp8a2.tif")
+        ref_tif = os.path.join(tmpdir, "ref.tif")
+        _write_test_geotiff(in1, [bare1], gt, "", nodata=255, predictor=1, block_size=128)
+        _write_test_geotiff(in2, [bare2], gt, "", nodata=255, predictor=1, block_size=128)
+        _write_test_geotiff(ref_tif, [ref], gt, "", nodata=0, predictor=1, block_size=128)
 
-    # Mathematical identity check
-    valid_mask = (ref1 > 0) & (gc > 0)
-    expected_dgc1 = np.where(valid_mask, 200 + gc.astype(int) - ref1.astype(int), 0).astype(np.uint8)
-    assert np.array_equal(dgc1, expected_dgc1), "Unconstrained DGC violates physical invariant"
+        manifest_path = os.path.join(tmpdir, "manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "bucket": "test-bucket",
+                    "ref_key": "DRCM/ref.tif",
+                    "output_prefix": "DRCM/aus/",
+                    "shards": [[in1, in2], [in2]],
+                },
+                f,
+            )
 
-    diff_dgc = np.max(np.abs(dgc1.astype(int) - direct_dgc.astype(int)))
-    diff_ref = np.max(np.abs(ref1.astype(int) - direct_ref_scaled.astype(int)))
+        class _FakeS3:
+            def __init__(self):
+                self.uploaded = {}
 
-    print(f"  Diff DGC (seasonalDRCMIbra --no-ibra vs direct global): {diff_dgc}")
-    print(f"  Diff Ref (seasonalDRCMIbra --no-ibra vs direct global): {diff_ref}")
+            def head_object(self, Bucket, Key):
+                if Key.endswith("202503202505_doda2.tif"):
+                    return {"ContentLength": 500_000_000}  # Simulate already-completed Season 1
+                raise FileNotFoundError(Key)
 
-    ds1 = None
-    in_ds = None
-    ref_ds = None
-    if os.path.exists(out_no_ibra):
-        os.remove(out_no_ibra)
+            def upload_file(self, Filename, Bucket, Key, Config=None):
+                self.uploaded[Key] = os.path.getsize(Filename)
 
-    assert diff_dgc == 0 and diff_ref == 0, f"Expected 0 diff, got DGC={diff_dgc}, Ref={diff_ref}"
-    print(">>> PASS: --no-ibra unconstrained mode (via /vsis3/) matches unconstrained baseline 100% bit-for-bit!")
+        fake_s3 = _FakeS3()
+        orig_build_s3 = run_aus_batch_worker._build_s3_client
+        orig_cache_fn = run_aus_batch_worker._ensure_local_ref_cache
+        orig_argv = sys.argv
+        try:
+            run_aus_batch_worker._build_s3_client = lambda: fake_s3
+            run_aus_batch_worker._ensure_local_ref_cache = lambda s3, b, k, d: (ref_tif, False)
+
+            # Local inputs in manifest: override path resolution just for local paths
+            orig_run = seasonalDRCMIbra.run_seasonal_drcm_ibra
+
+            def _wrapped_run(**kw):
+                ig = kw["input_groundcover"]
+                if ig.startswith("s3://test-bucket/"):
+                    kw["input_groundcover"] = ig[len("s3://test-bucket/"):]
+                return orig_run(**kw)
+
+            seasonalDRCMIbra.run_seasonal_drcm_ibra = _wrapped_run
+            fake_s3_upload_target = "DRCM/aus/lztmre_aus_m202506202508_doda2.tif"
+
+            # Allow upload verification head_object to pass once uploaded
+            orig_head = fake_s3.head_object
+
+            def _head_after_upload(Bucket, Key):
+                if Key in fake_s3.uploaded:
+                    return {"ContentLength": fake_s3.uploaded[Key]}
+                return orig_head(Bucket, Key)
+
+            fake_s3.head_object = _head_after_upload
+            sys.argv = [
+                "run_aus_batch_worker.py",
+                "--manifest", manifest_path,
+                "--shard-index", "0",
+                "--window", "11",
+                "--chunksize", "128",
+                "--minvalpercent", "0.10",
+                "--no-ibra",
+                "--no-overviews",
+                "--work-dir", os.path.join(tmpdir, "work"),
+                "--min-output-bytes", "100",
+            ]
+            run_aus_batch_worker.main()
+
+            # Season 1 was skipped, Season 2 was computed & uploaded
+            assert list(fake_s3.uploaded.keys()) == [fake_s3_upload_target]
+            assert fake_s3.uploaded[fake_s3_upload_target] > 100
+        finally:
+            sys.argv = orig_argv
+            run_aus_batch_worker._build_s3_client = orig_build_s3
+            run_aus_batch_worker._ensure_local_ref_cache = orig_cache_fn
+            seasonalDRCMIbra.run_seasonal_drcm_ibra = orig_run
+    print(">>> PASS: Batch submission manifest/command and worker skip-existing execution verified!")
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Run DRCM verification test suite.")
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Skip remote /vsis3/ tests (Tests 7 & 8) for local/CI verification without AWS access.",
+    )
+    args = parser.parse_args()
+
     t0 = time.perf_counter()
     test_1_utility_functions()
     test_2_groundcover_conversion()
     test_3_quantile_bounds_and_mean()
-    test_4_single_region_invariance()
+    test_4_single_region_invariance_and_slicing()
     test_5_boundary_isolation()
     test_6_ocean_and_valid_fraction()
-    test_7_satellite_multi_ibra_end_to_end()
-    test_8_satellite_no_ibra_mode()
+
+    if args.offline:
+        print("\n--- Tests 7 & 8: SKIPPED (--offline specified) ---")
+    else:
+        test_7_satellite_multi_ibra_end_to_end()
+        test_8_satellite_no_ibra_mode()
+
+    test_9_local_fast_tiled_reader_and_predictor_fallback()
+    test_10_multichunk_and_halo_aoi_parity()
+    test_11_batch_worker_and_submission()
+
     t_total = time.perf_counter() - t0
-    print(f"\n========================================================")
-    print(f"ALL 8 CHEAT-PROOF TESTS PASSED (100% /vsis3/ CLOUD-NATIVE) in {t_total:.2f}s!")
-    print(f"========================================================")
+    ran_label = "9 OFFLINE TESTS" if args.offline else "ALL 11 CHEAT-PROOF TESTS (100% /vsis3/ + FastLocal + AOI + Batch)"
+    print("\n========================================================")
+    print(f"{ran_label} PASSED in {t_total:.2f}s!")
+    print("========================================================")
 
 
 if __name__ == "__main__":
